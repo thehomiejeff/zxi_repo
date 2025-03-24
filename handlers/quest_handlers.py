@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 Command handlers for ChuzoBot's Quest System
 """
-
 import logging
 import json
 from typing import Dict, List, Any, Optional, Tuple
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
 from utils.logger import get_logger
 from utils.fangen_lore_manager import FangenLoreManager
 from utils.database import Database
@@ -39,7 +35,7 @@ logger = get_logger(__name__)
 class QuestCommandHandlers:
     """Command handlers for quest-related features."""
     
-    def __init__(self, quest_manager: QuestManager, lore_manager: FangenLoreManager, db: Database):
+    def __init__(self, db: Database, quest_manager: QuestManager, lore_manager: FangenLoreManager):
         """Initialize quest command handlers."""
         self.quest_manager = quest_manager
         self.lore_manager = lore_manager
@@ -54,70 +50,90 @@ class QuestCommandHandlers:
             
         user_id = update.effective_user.id
         
-        # Log user action
-        try:
-            async with ErrorContext(update, context, "database"):
-                self.db.execute_query(
-                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?",
-                    (user_id,)
-                )
-        except Exception as e:
-            logger.error(f"Database error in quests_command: {e}")
-        
         # Get available quests
         try:
-            available_quests = self.quest_manager.get_available_quests(user_id)
+            quests = self.quest_manager.get_available_quests(user_id)
         except Exception as e:
             logger.error(f"Error getting available quests: {e}")
-            available_quests = []
+            quests = []
         
-        if not available_quests:
-            await update.message.reply_text(
-                "No quests are currently available to you.\n\n"
-                "Check back later or explore the world to unlock new quests.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
-                ]])
+        # Get active quests
+        try:
+            active_quests = self.quest_manager.get_active_quests(user_id)
+        except Exception as e:
+            logger.error(f"Error getting active quests: {e}")
+            active_quests = []
+        
+        # Format message
+        if quests or active_quests:
+            message = "🗺️ *Available Quests* 🗺️\n\nSelect a quest to view details or begin your journey."
+            
+            # Create buttons for quests
+            buttons = []
+            
+            # Add active quests first
+            for quest in active_quests:
+                quest_id = quest.get("id")
+                quest_name = quest.get("name", "Unknown Quest")
+                quest_progress = quest.get("progress", 0)
+                
+                # Format progress as percentage
+                progress_text = f" ({quest_progress}%)" if quest_progress > 0 else ""
+                
+                buttons.append((
+                    f"🔵 {quest_name}{progress_text}",
+                    create_quest_view_callback(quest_id),
+                    "primary"
+                ))
+            
+            # Add available quests
+            for quest in quests:
+                quest_id = quest.get("id")
+                quest_name = quest.get("name", "Unknown Quest")
+                
+                # Skip if already in active quests
+                if any(active_quest.get("id") == quest_id for active_quest in active_quests):
+                    continue
+                
+                buttons.append((
+                    quest_name,
+                    create_quest_view_callback(quest_id),
+                    "secondary"
+                ))
+            
+            # Add back button
+            buttons.append((
+                "⬅️ Back to Main Menu",
+                create_callback_data("main_menu"),
+                "neutral"
+            ))
+            
+            # Create keyboard
+            keyboard = create_menu_keyboard(buttons)
+            
+        else:
+            message = (
+                "🗺️ *Quests* 🗺️\n\n"
+                "There are no quests available to you at this time. "
+                "Explore the world of Fangen to unlock new opportunities!"
             )
-            return
+            
+            # Create keyboard with just back button
+            keyboard = create_menu_keyboard([
+                ("📚 Explore Lore", create_callback_data("lore_menu"), "primary"),
+                ("⬅️ Back to Main Menu", create_callback_data("main_menu"), "neutral")
+            ])
         
-        # Create menu items for quests
-        menu_items = []
-        for quest in available_quests:
-            quest_id = quest.get("quest_id")
-            quest_name = quest.get("title", "Unnamed Quest")
-            callback_data = create_quest_view_callback(quest_name, quest_id)
-            menu_items.append((quest_name, callback_data, "secondary"))
-        
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add active quests button
-        active_button = create_styled_button(
-            "View Active Quests", 
-            create_callback_data("active_quests"), 
-            "primary"
-        )
-        keyboard.inline_keyboard.append([active_button])
-        
-        # Add main menu button
-        menu_button = create_styled_button(
-            "🏠 Main Menu", 
-            create_callback_data("main_menu"), 
-            "back"
-        )
-        keyboard.inline_keyboard.append([menu_button])
-        
+        # Send message
         await update.message.reply_text(
-            "📜 *Available Quests* 📜\n\n"
-            "Select a quest to view details:",
+            message,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
     
     @error_handler(error_type="general", custom_message="I couldn't access that quest. Please try again.")
     async def quest_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /quest command to view a specific quest."""
+        """Handle the /quest command to view or start a specific quest."""
         if not update or not update.effective_user or not update.message:
             logger.error("Update, effective_user, or message is None in quest_command")
             return
@@ -128,7 +144,8 @@ class QuestCommandHandlers:
         if not quest_name:
             await update.message.reply_text(
                 "Please provide a quest name after the command.\n"
-                "Example: `/quest The Lost Artifact`",
+                "Example: `/quest The Lost Artifact`\n\n"
+                "Or use /quests to see available quests.",
                 parse_mode='Markdown'
             )
             return
@@ -148,39 +165,75 @@ class QuestCommandHandlers:
             return
         
         # Display quest details
-        await self._display_quest_details(update, context, quest)
+        quest_id = quest.get("id")
+        await self._display_quest_details(update, context, quest_id)
     
-    async def _display_quest_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE, quest: Dict[str, Any]) -> None:
-        """Display quest details with buttons to start or view active quest."""
+    async def _display_quest_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE, quest_id: str) -> None:
+        """Display quest details and options."""
         if not update or not update.effective_user:
             logger.error("Update or effective_user is None in _display_quest_details")
             return
             
         user_id = update.effective_user.id
-        quest_id = quest.get("quest_id")
-        quest_name = quest.get("title", "Unnamed Quest")
+        
+        # Get quest details
+        try:
+            quest = self.quest_manager.get_quest_details(quest_id)
+        except Exception as e:
+            logger.error(f"Error getting quest details: {e}")
+            
+            # Send error message
+            if update.callback_query:
+                await update.callback_query.answer("Error retrieving quest details. Please try again.")
+            elif update.message:
+                await update.message.reply_text("Error retrieving quest details. Please try again.")
+            return
+        
+        if not quest:
+            # Send error message
+            if update.callback_query:
+                await update.callback_query.answer("Quest not found. Please try another quest.")
+            elif update.message:
+                await update.message.reply_text("Quest not found. Please try another quest.")
+            return
         
         # Check if user has this quest active
         try:
-            active_quest = self.quest_manager.get_active_quest(user_id, quest_id)
+            is_active = self.quest_manager.is_quest_active(user_id, quest_id)
+            progress = self.quest_manager.get_quest_progress(user_id, quest_id) if is_active else 0
         except Exception as e:
-            logger.error(f"Error checking active quest: {e}")
-            active_quest = None
+            logger.error(f"Error checking quest status: {e}")
+            is_active = False
+            progress = 0
         
         # Format quest details
+        quest_name = quest.get("name", "Unknown Quest")
         description = quest.get("description", "No description available.")
         difficulty = quest.get("difficulty", "Unknown")
-        rewards = quest.get("rewards", [])
+        rewards = quest.get("rewards", {})
         
+        # Format rewards text
         rewards_text = ""
         if rewards:
             rewards_text = "\n\n*Rewards:*\n"
-            for reward in rewards:
-                rewards_text += f"• {reward.get('name', 'Unknown')} x{reward.get('quantity', 1)}\n"
+            for reward_type, reward_value in rewards.items():
+                if reward_type == "items":
+                    for item, quantity in reward_value.items():
+                        rewards_text += f"• {item} x{quantity}\n"
+                elif reward_type == "lore":
+                    rewards_text += f"• Lore: {', '.join(reward_value)}\n"
+                elif reward_type == "characters":
+                    rewards_text += f"• Meet: {', '.join(reward_value)}\n"
+                else:
+                    rewards_text += f"• {reward_type.capitalize()}: {reward_value}\n"
+        
+        # Format progress text
+        progress_text = f"\n\n*Progress:* {progress}%" if is_active and progress > 0 else ""
         
         message = (
-            f"📜 *{quest_name}* 📜\n\n"
-            f"*Difficulty:* {difficulty}\n\n"
+            f"🗺️ *{quest_name}* 🗺️\n\n"
+            f"*Difficulty:* {difficulty}\n"
+            f"{progress_text}\n\n"
             f"{description}"
             f"{rewards_text}"
         )
@@ -188,39 +241,39 @@ class QuestCommandHandlers:
         # Create buttons
         keyboard = []
         
-        if active_quest:
-            # Quest is active, add continue button
+        if is_active:
+            # Continue button
             keyboard.append([
                 create_styled_button(
-                    "Continue Quest", 
+                    "▶️ Continue Quest", 
                     create_callback_data("quest_continue", id=quest_id), 
                     "primary"
                 )
             ])
             
-            # Add abandon button
+            # Abandon button
             keyboard.append([
                 create_styled_button(
-                    "Abandon Quest", 
+                    "❌ Abandon Quest", 
                     create_callback_data("quest_abandon", id=quest_id), 
                     "danger"
                 )
             ])
         else:
-            # Quest is not active, add start button
+            # Start button
             keyboard.append([
                 create_styled_button(
-                    "Start Quest", 
-                    create_quest_start_callback(quest_name, quest_id), 
+                    "▶️ Start Quest", 
+                    create_quest_start_callback(quest_id), 
                     "primary"
                 )
             ])
         
-        # Add back button
+        # Back button
         keyboard.append([
             create_styled_button(
                 "« Back to Quests", 
-                create_callback_data("quests_back"), 
+                create_callback_data("quest_menu"), 
                 "back"
             )
         ])
@@ -245,7 +298,7 @@ class QuestCommandHandlers:
             if update.effective_chat:
                 try:
                     await update.effective_chat.send_message(
-                        text=f"Error displaying quest details for '{quest_name}'. Please try again.",
+                        text=f"Error displaying quest details for {quest_name}. Please try again.",
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("🔄 Try Again", callback_data='{"action":"retry"}'),
                             InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
@@ -255,161 +308,282 @@ class QuestCommandHandlers:
                     logger.error(f"Failed to send fallback message: {inner_e}")
     
     @error_handler(error_type="callback", custom_message="I couldn't process that button press. Please try again.")
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle callback queries for quest-related features."""
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: Dict) -> None:
+        """Handle callback queries for quest-related actions."""
         if not update or not update.callback_query or not update.effective_user:
             logger.error("Update, callback_query, or effective_user is None in handle_callback")
             return
             
-        query = update.callback_query
+        callback_query = update.callback_query
+        user_id = update.effective_user.id
+        action = callback_data.get("action", "")
         
-        # Parse callback data
-        try:
-            callback_data = parse_callback_data(query.data)
-            action = callback_data.get("action", "")
-        except Exception as e:
-            logger.error(f"Failed to parse callback data: {e}")
-            await query.answer("Invalid callback data")
+        # Handle different actions
+        if action == "quest_menu":
+            # Create a fake message to reuse the quests_command method
+            update.message = callback_query.message
+            await self.quests_command(update, context)
+            
+        elif action == "quest_view":
+            quest_id = callback_data.get("id")
+            if quest_id:
+                await self._display_quest_details(update, context, quest_id)
+            else:
+                await callback_query.answer("Invalid quest ID. Please try again.")
+                
+        elif action == "quest_start":
+            quest_id = callback_data.get("id")
+            if quest_id:
+                try:
+                    # Start the quest
+                    success = await self.quest_manager.start_quest(user_id, quest_id)
+                    
+                    if success:
+                        # Get the first scene
+                        scene = await self.quest_manager.get_current_scene(user_id, quest_id)
+                        
+                        if scene:
+                            # Display the scene
+                            await self._display_quest_scene(update, context, quest_id, scene)
+                        else:
+                            await callback_query.answer("Error retrieving quest scene. Please try again.")
+                    else:
+                        await callback_query.answer("Failed to start quest. Please try again.")
+                except Exception as e:
+                    logger.error(f"Error starting quest: {e}")
+                    await callback_query.answer("Error starting quest. Please try again.")
+            else:
+                await callback_query.answer("Invalid quest ID. Please try again.")
+                
+        elif action == "quest_continue":
+            quest_id = callback_data.get("id")
+            if quest_id:
+                try:
+                    # Get the current scene
+                    scene = await self.quest_manager.get_current_scene(user_id, quest_id)
+                    
+                    if scene:
+                        # Display the scene
+                        await self._display_quest_scene(update, context, quest_id, scene)
+                    else:
+                        await callback_query.answer("Error retrieving quest scene. Please try again.")
+                except Exception as e:
+                    logger.error(f"Error continuing quest: {e}")
+                    await callback_query.answer("Error continuing quest. Please try again.")
+            else:
+                await callback_query.answer("Invalid quest ID. Please try again.")
+                
+        elif action == "quest_choice":
+            quest_id = callback_data.get("id")
+            scene_id = callback_data.get("scene")
+            choice_id = callback_data.get("choice")
+            
+            if quest_id and scene_id and choice_id:
+                try:
+                    # Make the choice
+                    next_scene = await self.quest_manager.make_choice(user_id, quest_id, scene_id, choice_id)
+                    
+                    if next_scene:
+                        # Display the next scene
+                        await self._display_quest_scene(update, context, quest_id, next_scene)
+                    else:
+                        # Quest might be completed
+                        completed = await self.quest_manager.is_quest_completed(user_id, quest_id)
+                        
+                        if completed:
+                            # Display completion message
+                            await self._display_quest_completion(update, context, quest_id)
+                        else:
+                            await callback_query.answer("Error advancing quest. Please try again.")
+                except Exception as e:
+                    logger.error(f"Error making quest choice: {e}")
+                    await callback_query.answer("Error making quest choice. Please try again.")
+            else:
+                await callback_query.answer("Invalid quest choice. Please try again.")
+                
+        elif action == "quest_abandon":
+            quest_id = callback_data.get("id")
+            if quest_id:
+                try:
+                    # Confirm abandonment
+                    keyboard = [
+                        [
+                            create_styled_button(
+                                "Yes, Abandon Quest", 
+                                create_callback_data("quest_abandon_confirm", id=quest_id), 
+                                "danger"
+                            )
+                        ],
+                        [
+                            create_styled_button(
+                                "No, Keep Quest", 
+                                create_quest_view_callback(quest_id), 
+                                "primary"
+                            )
+                        ]
+                    ]
+                    
+                    await callback_query.edit_message_text(
+                        "⚠️ *Are you sure you want to abandon this quest?* ⚠️\n\n"
+                        "All progress will be lost and you'll need to start over if you want to attempt it again.",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Error displaying abandon confirmation: {e}")
+                    await callback_query.answer("Error displaying abandon confirmation. Please try again.")
+            else:
+                await callback_query.answer("Invalid quest ID. Please try again.")
+                
+        elif action == "quest_abandon_confirm":
+            quest_id = callback_data.get("id")
+            if quest_id:
+                try:
+                    # Abandon the quest
+                    success = await self.quest_manager.abandon_quest(user_id, quest_id)
+                    
+                    if success:
+                        await callback_query.answer("Quest abandoned successfully.")
+                        
+                        # Return to quest menu
+                        update.message = callback_query.message
+                        await self.quests_command(update, context)
+                    else:
+                        await callback_query.answer("Failed to abandon quest. Please try again.")
+                except Exception as e:
+                    logger.error(f"Error abandoning quest: {e}")
+                    await callback_query.answer("Error abandoning quest. Please try again.")
+            else:
+                await callback_query.answer("Invalid quest ID. Please try again.")
+        
+        else:
+            await callback_query.answer("Unknown quest action. Please try again.")
+    
+    async def _display_quest_scene(self, update: Update, context: ContextTypes.DEFAULT_TYPE, quest_id: str, scene: Dict) -> None:
+        """Display a quest scene with choices."""
+        if not update or not update.callback_query or not update.effective_user:
+            logger.error("Update, callback_query, or effective_user is None in _display_quest_scene")
             return
+            
+        callback_query = update.callback_query
         
-        # Answer callback query with appropriate message
-        feedback_messages = {
-            "quest_view": "Loading quest details...",
-            "quest_start": "Starting quest...",
-            "quest_choice": "Processing your choice...",
-            "quest_abandon": "Abandoning quest...",
-            "quest_continue": "Continuing quest...",
-            "craft_check": "Checking recipe...",
-            "craft_confirm": "Crafting item...",
-            "inventory_details": "Loading item details...",
-            "inventory_craft": "Opening crafting menu...",
-            "inventory_back": "Going back...",
-            "interact_char": "Interacting with character...",
-            "interact_topic": "Discussing topic...",
-            "quests_back": "Going back to quests...",
-            "active_quests": "Loading active quests...",
-            "characters_menu": "Loading characters...",
-            "inventory_menu": "Loading inventory...",
-            "quests_menu": "Loading quests..."
-        }
+        # Extract scene details
+        scene_id = scene.get("id")
+        text = scene.get("text", "No scene text available.")
+        choices = scene.get("choices", [])
         
+        # Format message
+        message = f"{text}"
+        
+        # Create buttons for choices
+        keyboard = []
+        for choice in choices:
+            choice_id = choice.get("id")
+            choice_text = choice.get("text", "No choice text available.")
+            
+            keyboard.append([
+                create_styled_button(
+                    choice_text, 
+                    create_quest_choice_callback(quest_id, scene_id, choice_id), 
+                    "primary"
+                )
+            ])
+        
+        # Add back button to view quest details
+        keyboard.append([
+            create_styled_button(
+                "« Quest Details", 
+                create_quest_view_callback(quest_id), 
+                "back"
+            )
+        ])
+        
+        # Send or edit message
         try:
-            await query.answer(feedback_messages.get(action, "Processing..."))
+            await callback_query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         except Exception as e:
-            logger.warning(f"Failed to answer callback query: {e}")
-        
-        # Get user ID
+            logger.error(f"Error sending quest scene: {e}")
+            await callback_query.answer("Error displaying quest scene. Please try again.")
+    
+    async def _display_quest_completion(self, update: Update, context: ContextTypes.DEFAULT_TYPE, quest_id: str) -> None:
+        """Display quest completion message and rewards."""
+        if not update or not update.callback_query or not update.effective_user:
+            logger.error("Update, callback_query, or effective_user is None in _display_quest_completion")
+            return
+            
+        callback_query = update.callback_query
         user_id = update.effective_user.id
         
-        # Store the current action in user_data for retry functionality
-        if context and context.user_data is not None:
-            context.user_data["last_action"] = query.data
-        
-        # Handle different callback types
+        # Get quest details
         try:
-            if action == "quest_view":
-                await self._handle_quest_view_callback(update, context, callback_data)
-            elif action == "quest_start":
-                await self._handle_quest_start_callback(update, context, callback_data)
-            elif action == "quest_choice":
-                await self._handle_quest_choice_callback(update, context, callback_data)
-            elif action == "quest_abandon":
-                await self._handle_quest_abandon_callback(update, context, callback_data)
-            elif action == "quest_continue":
-                await self._handle_quest_continue_callback(update, context, callback_data)
-            elif action == "craft_check":
-                await self._handle_craft_check_callback(update, context, callback_data)
-            elif action == "craft_confirm":
-                await self._handle_craft_confirm_callback(update, context, callback_data)
-            elif action == "inventory_details":
-                await self._handle_inventory_details_callback(update, context, callback_data)
-            elif action == "inventory_craft":
-                await self._handle_inventory_craft_callback(update, context, callback_data)
-            elif action == "inventory_back":
-                await self._handle_inventory_back_callback(update, context)
-            elif action == "interact_char":
-                await self._handle_interact_char_callback(update, context, callback_data)
-            elif action == "interact_topic":
-                await self._handle_interact_topic_callback(update, context, callback_data)
-            elif action == "quests_back":
-                await self._handle_quests_back_callback(update, context)
-            elif action == "active_quests":
-                await self._handle_active_quests_callback(update, context)
-            elif action == "characters_menu":
-                await self._handle_characters_menu_callback(update, context)
-            elif action == "inventory_menu":
-                await self._handle_inventory_menu_callback(update, context)
-            elif action == "quests_menu":
-                await self._handle_quests_menu_callback(update, context)
-            else:
-                logger.warning(f"Unknown quest callback action: {action}")
-                await query.edit_message_text(
-                    "I'm not sure how to handle that request.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
-                    ]])
-                )
+            quest = self.quest_manager.get_quest_details(quest_id)
+            rewards = quest.get("rewards", {})
         except Exception as e:
-            logger.error(f"Error handling callback {action}: {e}")
-            # Try to provide a graceful fallback
-            try:
-                await query.edit_message_text(
-                    "Sorry, I encountered an error processing your request.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔄 Try Again", callback_data='{"action":"retry"}'),
-                        InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
-                    ]])
-                )
-            except Exception as inner_e:
-                logger.error(f"Failed to send error message: {inner_e}")
-    
-    # Helper methods for handling specific callback types
-    # These methods would be implemented here...
-    # For brevity, I'm not including all of them in this example
-
-    async def _handle_quest_view_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: Dict[str, Any]) -> None:
-        """Handle callback for viewing quest details."""
-        if not update or not update.callback_query or not update.effective_user:
-            logger.error("Update, callback_query, or effective_user is None in _handle_quest_view_callback")
-            return
-            
-        query = update.callback_query
+            logger.error(f"Error getting quest details: {e}")
+            quest = None
+            rewards = {}
         
-        # Get quest ID or name
-        quest_id = callback_data.get("id")
-        quest_name = callback_data.get("name")
-        
-        if not quest_id and not quest_name:
-            await query.edit_message_text("Invalid quest selection.")
+        if not quest:
+            await callback_query.answer("Error retrieving quest details. Please try again.")
             return
         
-        try:
-            # Find quest by ID or name
-            if quest_id:
-                quest = self.quest_manager.get_quest_by_id(quest_id)
-            else:
-                quest = self.quest_manager.find_quest_by_name(quest_name)
-            
-            if not quest:
-                await query.edit_message_text(
-                    f"Quest not found.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("« Back to Quests", callback_data='{"action":"quests_back"}')
-                    ]])
+        quest_name = quest.get("name", "Unknown Quest")
+        
+        # Format rewards text
+        rewards_text = ""
+        if rewards:
+            rewards_text = "\n\n*Rewards:*\n"
+            for reward_type, reward_value in rewards.items():
+                if reward_type == "items":
+                    for item, quantity in reward_value.items():
+                        rewards_text += f"• {item} x{quantity}\n"
+                elif reward_type == "lore":
+                    rewards_text += f"• Lore: {', '.join(reward_value)}\n"
+                elif reward_type == "characters":
+                    rewards_text += f"• Meet: {', '.join(reward_value)}\n"
+                else:
+                    rewards_text += f"• {reward_type.capitalize()}: {reward_value}\n"
+        
+        message = (
+            f"🎉 *Quest Completed!* 🎉\n\n"
+            f"Congratulations! You have successfully completed the quest:\n"
+            f"*{quest_name}*"
+            f"{rewards_text}\n\n"
+            f"Your journey continues..."
+        )
+        
+        # Create buttons
+        keyboard = [
+            [
+                create_styled_button(
+                    "🗺️ More Quests", 
+                    create_callback_data("quest_menu"), 
+                    "primary"
                 )
-                return
-            
-            # Display quest details
-            await self._display_quest_details(update, context, quest)
-        except Exception as e:
-            logger.error(f"Error in _handle_quest_view_callback: {e}")
-            await query.edit_message_text(
-                f"I encountered an error loading the quest details. Please try again.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("« Back to Quests", callback_data='{"action":"quests_back"}')
-                ]])
+            ],
+            [
+                create_styled_button(
+                    "🏠 Main Menu", 
+                    create_callback_data("main_menu"), 
+                    "neutral"
+                )
+            ]
+        ]
+        
+        # Send or edit message
+        try:
+            await callback_query.edit_message_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
-
+        except Exception as e:
+            logger.error(f"Error sending quest completion: {e}")
+            await callback_query.answer("Error displaying quest completion. Please try again.")
+    
     async def active_quests_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle the /active command to view active quests."""
         if not update or not update.effective_user or not update.message:
@@ -425,51 +599,56 @@ class QuestCommandHandlers:
             logger.error(f"Error getting active quests: {e}")
             active_quests = []
         
-        if not active_quests:
-            await update.message.reply_text(
-                "You don't have any active quests.\n\n"
-                "Use /quests to browse available quests.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Browse Quests", callback_data='{"action":"quests_menu"}')
-                ]])
+        # Format message
+        if active_quests:
+            message = "🔵 *Your Active Quests* 🔵\n\nSelect a quest to continue your journey."
+            
+            # Create buttons for quests
+            buttons = []
+            for quest in active_quests:
+                quest_id = quest.get("id")
+                quest_name = quest.get("name", "Unknown Quest")
+                quest_progress = quest.get("progress", 0)
+                
+                # Format progress as percentage
+                progress_text = f" ({quest_progress}%)" if quest_progress > 0 else ""
+                
+                buttons.append((
+                    f"{quest_name}{progress_text}",
+                    create_quest_view_callback(quest_id),
+                    "primary"
+                ))
+            
+            # Add back button
+            buttons.append((
+                "⬅️ Back to Main Menu",
+                create_callback_data("main_menu"),
+                "neutral"
+            ))
+            
+            # Create keyboard
+            keyboard = create_menu_keyboard(buttons)
+            
+        else:
+            message = (
+                "🔵 *Active Quests* 🔵\n\n"
+                "You don't have any active quests at the moment. "
+                "Use /quests to browse available quests and start a new adventure!"
             )
-            return
+            
+            # Create keyboard with just back button
+            keyboard = create_menu_keyboard([
+                ("🗺️ View Quests", create_callback_data("quest_menu"), "primary"),
+                ("⬅️ Back to Main Menu", create_callback_data("main_menu"), "neutral")
+            ])
         
-        # Create menu items for quests
-        menu_items = []
-        for quest in active_quests:
-            quest_id = quest.get("quest_id")
-            quest_name = quest.get("title", "Unnamed Quest")
-            callback_data = create_callback_data("quest_continue", id=quest_id)
-            menu_items.append((quest_name, callback_data, "secondary"))
-        
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add browse quests button
-        browse_button = create_styled_button(
-            "Browse Available Quests", 
-            create_callback_data("quests_menu"), 
-            "primary"
-        )
-        keyboard.inline_keyboard.append([browse_button])
-        
-        # Add main menu button
-        menu_button = create_styled_button(
-            "🏠 Main Menu", 
-            create_callback_data("main_menu"), 
-            "back"
-        )
-        keyboard.inline_keyboard.append([menu_button])
-        
+        # Send message
         await update.message.reply_text(
-            "📜 *Your Active Quests* 📜\n\n"
-            f"You have {len(active_quests)} active quest(s).\n\n"
-            "Select a quest to continue:",
+            message,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
-
+    
     async def inventory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle the /inventory command to view inventory."""
         if not update or not update.effective_user or not update.message:
@@ -478,169 +657,140 @@ class QuestCommandHandlers:
             
         user_id = update.effective_user.id
         
-        # Get inventory items
+        # Get inventory
         try:
             inventory = self.quest_manager.get_inventory(user_id)
         except Exception as e:
             logger.error(f"Error getting inventory: {e}")
             inventory = []
         
-        if not inventory:
-            await update.message.reply_text(
-                "Your inventory is empty.\n\n"
-                "Complete quests to earn items.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Browse Quests", callback_data='{"action":"quests_menu"}')
-                ]])
+        # Format message
+        if inventory:
+            message = "🎒 *Your Inventory* 🎒\n\nHere are the items you've collected on your journeys:"
+            
+            # Group items by rarity
+            items_by_rarity = {}
+            for item in inventory:
+                rarity = item.get("rarity", "Common")
+                if rarity not in items_by_rarity:
+                    items_by_rarity[rarity] = []
+                items_by_rarity[rarity].append(item)
+            
+            # Order rarities
+            rarity_order = ["Legendary", "Epic", "Rare", "Uncommon", "Common"]
+            
+            # Add items to message
+            for rarity in rarity_order:
+                if rarity in items_by_rarity:
+                    message += f"\n\n*{rarity} Items:*\n"
+                    for item in items_by_rarity[rarity]:
+                        item_name = item.get("name", "Unknown Item")
+                        quantity = item.get("quantity", 1)
+                        message += f"• {item_name} x{quantity}\n"
+            
+        else:
+            message = (
+                "🎒 *Your Inventory* 🎒\n\n"
+                "Your inventory is empty. Complete quests and explore the world "
+                "to find valuable items and resources!"
             )
-            return
         
-        # Create menu items for items
-        menu_items = []
-        for item in inventory:
-            item_name = item.get("item_name", "Unknown Item")
-            quantity = item.get("quantity", 1)
-            display_name = f"{item_name} (x{quantity})"
-            callback_data = create_callback_data("inventory_details", name=item_name)
-            menu_items.append((display_name, callback_data, "secondary"))
+        # Create keyboard with back button
+        keyboard = create_menu_keyboard([
+            ("🔨 Craft Items", create_callback_data("craft_menu"), "primary"),
+            ("⬅️ Back to Main Menu", create_callback_data("main_menu"), "neutral")
+        ])
         
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add craft button
-        craft_button = create_styled_button(
-            "Craft Items", 
-            create_callback_data("inventory_craft"), 
-            "primary"
-        )
-        keyboard.inline_keyboard.append([craft_button])
-        
-        # Add main menu button
-        menu_button = create_styled_button(
-            "🏠 Main Menu", 
-            create_callback_data("main_menu"), 
-            "back"
-        )
-        keyboard.inline_keyboard.append([menu_button])
-        
+        # Send message
         await update.message.reply_text(
-            "🎒 *Your Inventory* 🎒\n\n"
-            f"You have {len(inventory)} different item(s) in your inventory.\n\n"
-            "Select an item to view details:",
+            message,
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
-
+    
+    @error_handler(error_type="general", custom_message="I couldn't access the crafting system. Please try again.")
     async def craft_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /craft command to craft items."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in craft_command")
+        """Handle the /craft command to craft items.
+        
+        Args:
+            update: The update containing the command
+            context: The context object for the bot
+        """
+        if not update or not update.message:
             return
-            
+        
         user_id = update.effective_user.id
         
-        # Get available recipes
+        # Get craftable items
         try:
-            recipes = self.quest_manager.get_available_recipes(user_id)
-        except Exception as e:
-            logger.error(f"Error getting recipes: {e}")
-            recipes = []
-        
-        if not recipes:
-            await update.message.reply_text(
-                "You don't have any available recipes.\n\n"
-                "Discover recipes by completing quests and exploring the world.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("View Inventory", callback_data='{"action":"inventory_menu"}')
-                ]])
+            # Get recipes
+            recipes = self.db.execute_query(
+                "SELECT * FROM crafting_recipes ORDER BY result_rarity"
             )
-            return
-        
-        # Create menu items for recipes
-        menu_items = []
-        for recipe in recipes:
-            recipe_name = recipe.get("name", "Unknown Recipe")
-            callback_data = create_callback_data("craft_check", name=recipe_name)
-            menu_items.append((recipe_name, callback_data, "secondary"))
-        
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add inventory button
-        inventory_button = create_styled_button(
-            "View Inventory", 
-            create_callback_data("inventory_menu"), 
-            "primary"
-        )
-        keyboard.inline_keyboard.append([inventory_button])
-        
-        # Add main menu button
-        menu_button = create_styled_button(
-            "🏠 Main Menu", 
-            create_callback_data("main_menu"), 
-            "back"
-        )
-        keyboard.inline_keyboard.append([menu_button])
-        
-        await update.message.reply_text(
-            "⚒️ *Crafting* ⚒️\n\n"
-            f"You have {len(recipes)} available recipe(s).\n\n"
-            "Select a recipe to craft:",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
-
-    async def characters_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /characters command to view characters."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in characters_command")
-            return
             
-        user_id = update.effective_user.id
-        
-        # Get available characters
-        try:
-            characters = self.quest_manager.get_available_characters(user_id)
-        except Exception as e:
-            logger.error(f"Error getting characters: {e}")
-            characters = []
-        
-        if not characters:
-            await update.message.reply_text(
-                "No characters are currently available to interact with.\n\n"
-                "Progress through quests to meet characters.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Browse Quests", callback_data='{"action":"quests_menu"}')
-                ]])
+            if not recipes:
+                await update.message.reply_text(
+                    "There are no items available to craft at this time. "
+                    "Check back later or discover more recipes through quests."
+                )
+                return
+            
+            # Create message text
+            message_text = (
+                "🔨 *Crafting Workshop* 🔨\n\n"
+                "Here you can craft items using materials you've collected on your journeys. "
+                "Select an item to view its recipe and craft it if you have the required materials."
             )
-            return
-        
-        # Create menu items for characters
-        menu_items = []
-        for character in characters:
-            character_name = character.get("name", "Unknown Character")
-            callback_data = create_callback_data("interact_char", name=character_name)
-            menu_items.append((character_name, callback_data, "secondary"))
-        
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add main menu button
-        menu_button = create_styled_button(
-            "🏠 Main Menu", 
-            create_callback_data("main_menu"), 
-            "back"
-        )
-        keyboard.inline_keyboard.append([menu_button])
-        
-        await update.message.reply_text(
-            "👥 *Characters* 👥\n\n"
-            f"There are {len(characters)} character(s) available to interact with.\n\n"
-            "Select a character to interact with:",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
-
+            
+            # Create buttons for each craftable item
+            buttons = []
+            for recipe in recipes:
+                item_name = recipe["result_item"]
+                rarity = recipe["result_rarity"]
+                
+                # Check if user can craft this item
+                can_craft, _, _ = self.db.can_craft_item(user_id, item_name)
+                
+                # Add indicator if user can craft
+                status = "✅ " if can_craft else ""
+                
+                buttons.append((
+                    f"{status}{item_name} ({rarity})",
+                    create_callback_data("craft_view", {"item": item_name}),
+                    "primary" if can_craft else "secondary"
+                ))
+            
+            # Add back button
+            buttons.append((
+                "⬅️ Back to Main Menu",
+                create_callback_data("main_menu"),
+                "neutral"
+            ))
+            
+            # Create paginated keyboard if there are many items
+            if len(buttons) > 8:
+                keyboard = create_paginated_keyboard(
+                    buttons, 
+                    page=0, 
+                    items_per_page=6,
+                    callback_prefix="craft_page"
+                )
+            else:
+                keyboard = create_menu_keyboard(buttons)
+            
+            # Send message with crafting menu
+            await update.message.reply_text(
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error displaying crafting menu: {e}", exc_info=True)
+            await update.message.reply_text(
+                "I encountered an error accessing the crafting system. Please try again later."
+            )
+    
     async def interact_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle the /interact command to interact with a character."""
         if not update or not update.effective_user or not update.message:
@@ -761,3 +911,115 @@ class QuestCommandHandlers:
                     )
                 except Exception as inner_e:
                     logger.error(f"Failed to send fallback message: {inner_e}")
+    
+    async def characters_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Display the characters menu when clicked from main menu.
+        
+        Args:
+            update: The update containing the callback query
+            context: The context object for the bot
+        """
+        if not update or not update.callback_query:
+            return
+        
+        callback_query = update.callback_query
+        user_id = update.effective_user.id
+        
+        # Get characters the user has met
+        try:
+            characters = self.db.execute_query(
+                "SELECT * FROM user_progress WHERE user_id = ? AND category = 'characters' AND discovered = TRUE",
+                (user_id,)
+            )
+            
+            if not characters:
+                characters = []
+            
+            # Create message text
+            if characters:
+                message_text = (
+                    "🧙‍♂️ *Characters You've Met* 🧙‍♀️\n\n"
+                    "Here are the characters you've encountered in your journey through Fangen. "
+                    "Select a character to learn more about them or interact with them."
+                )
+                
+                # Create buttons for each character
+                buttons = []
+                for character in characters:
+                    character_name = character["item_name"]
+                    buttons.append((
+                        f"{character_name}",
+                        create_callback_data("character_view", {"name": character_name}),
+                        "primary"
+                    ))
+                
+                # Add a button to search for characters
+                buttons.append((
+                    "🔍 Find Characters",
+                    create_callback_data("character_search"),
+                    "secondary"
+                ))
+                
+                # Add back button
+                buttons.append((
+                    "⬅️ Back to Main Menu",
+                    create_callback_data("main_menu"),
+                    "neutral"
+                ))
+                
+                # Create keyboard with optimized layout
+                keyboard = create_menu_keyboard(buttons)
+                
+            else:
+                message_text = (
+                    "🧙‍♂️ *Characters of Fangen* 🧙‍♀️\n\n"
+                    "You haven't met any characters yet! As you explore the world and "
+                    "complete quests, you'll encounter various inhabitants of Fangen.\n\n"
+                    "Start a quest to begin meeting characters."
+                )
+                
+                # Create keyboard with quest and back buttons
+                buttons = [
+                    ("🗺️ View Quests", create_callback_data("quest_menu"), "primary"),
+                    ("⬅️ Back to Main Menu", create_callback_data("main_menu"), "neutral")
+                ]
+                keyboard = create_menu_keyboard(buttons)
+            
+            # Edit the message with the characters menu
+            await callback_query.edit_message_text(
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error displaying characters menu: {e}", exc_info=True)
+            await callback_query.answer("Error displaying characters menu. Please try again.")
+
+    @error_handler(error_type="general", custom_message="I couldn't access the characters. Please try again.")
+    async def characters_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /characters command to view characters the user has met.
+        
+        Args:
+            update: The update containing the command
+            context: The context object for the bot
+        """
+        if not update or not update.message:
+            return
+        
+        user_id = update.effective_user.id
+        
+        # Create a fake callback query to reuse the characters_menu method
+        class FakeCallbackQuery:
+            async def edit_message_text(self, text, reply_markup, parse_mode):
+                await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            
+            async def answer(self, text):
+                pass
+        
+        # Create a fake update with the callback query
+        fake_update = Update.de_json(update.to_dict(), context.bot)
+        fake_update.callback_query = FakeCallbackQuery()
+        
+        # Call the characters_menu method
+        await self.characters_menu(fake_update, context)
