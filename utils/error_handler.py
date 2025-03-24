@@ -9,7 +9,7 @@ This module provides utilities for standardized error handling and user-friendly
 
 import logging
 import traceback
-from typing import Tuple, Optional, Callable, Any, Dict
+from typing import Tuple, Optional, Callable, Any, Dict, Union
 from functools import wraps
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -110,13 +110,26 @@ def error_handler(error_type: str = "general", custom_message: Optional[str] = N
     """
     def decorator(func: Callable):
         @wraps(func)
-        async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            try:
-                return await func(self, update, context, *args, **kwargs)
-            except Exception as e:
-                await handle_error(update, context, error_type, e, custom_message)
-                # Return None instead of re-raising to prevent global error handler from being triggered
-                return None
+        async def wrapper(*args, **kwargs):
+            # Check if this is a method (with self) or a standalone function
+            if len(args) >= 1 and hasattr(args[0], '__class__') and not isinstance(args[0], Update):
+                # This is a method call (with self)
+                self, update, context, *rest_args = args
+                try:
+                    return await func(self, update, context, *rest_args, **kwargs)
+                except Exception as e:
+                    await handle_error(update, context, error_type, e, custom_message)
+                    # Return None instead of re-raising to prevent global error handler from being triggered
+                    return None
+            else:
+                # This is a standalone function call
+                update, context, *rest_args = args
+                try:
+                    return await func(update, context, *rest_args, **kwargs)
+                except Exception as e:
+                    await handle_error(update, context, error_type, e, custom_message)
+                    # Return None instead of re-raising to prevent global error handler from being triggered
+                    return None
         return wrapper
     return decorator
 
@@ -124,30 +137,54 @@ class ErrorContext:
     """
     Context manager for error handling.
     
-    Example:
+    Examples:
+        # For handling errors in async functions with update and context
         async with ErrorContext(update, context, "database"):
+            # Code that might raise an exception
+            db.execute_query("SELECT * FROM users")
+            
+        # For handling errors with just a database object
+        with ErrorContext(db, error_type="database"):
             # Code that might raise an exception
             db.execute_query("SELECT * FROM users")
     """
     
     def __init__(
         self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
+        first_arg: Union[Update, Any],
+        second_arg: Optional[Union[ContextTypes.DEFAULT_TYPE, str]] = None,
         error_type: str = "general",
         custom_message: Optional[str] = None
     ):
-        self.update = update
-        self.context = context
-        self.error_type = error_type
-        self.custom_message = custom_message
+        # Check if this is being used with update and context
+        if isinstance(first_arg, Update):
+            self.update = first_arg
+            self.context = second_arg
+            self.error_type = error_type
+            self.custom_message = custom_message
+            self.db_only = False
+        else:
+            # This is being used with just a database object
+            self.db = first_arg
+            self.error_type = second_arg or "database"
+            self.custom_message = error_type if isinstance(error_type, str) and error_type != "general" else custom_message
+            self.db_only = True
     
     async def __aenter__(self):
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
+        if exc_type is not None and not self.db_only:
             await handle_error(self.update, self.context, self.error_type, exc_val, self.custom_message)
+            return True  # Suppress the exception
+        return False
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None and self.db_only:
+            logger.error(f"Database error: {str(exc_val)}")
             return True  # Suppress the exception
         return False
 
