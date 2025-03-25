@@ -2,302 +2,361 @@
 # -*- coding: utf-8 -*-
 
 """
-ZXI: The Lore-Driven Telegram Companion for the World of Fangen
-Main entry point for the Telegram bot
+Main entry point for ZXI Bot
+Handles bot initialization, command registration, and callback routing
 """
 
-import logging
 import os
 import sys
+import logging
 import json
 from datetime import datetime
-import importlib
+from typing import Dict, Any, Optional, List, Tuple, Union
 
-from config import BOT_TOKEN, ADMIN_IDS, LOG_LEVEL
-from utils.logger import setup_logger
-
-# Set up logging
-logger = setup_logger(__name__, LOG_LEVEL)
-
-# Check python-telegram-bot version and import appropriate modules
-def get_telegram_bot_version():
-    try:
-        import telegram
-        version = telegram.__version__.split('.')
-        major_version = int(version[0])
-        return major_version
-    except (ImportError, AttributeError, ValueError, IndexError):
-        logger.warning("Could not determine python-telegram-bot version, assuming version 13.x")
-        return 13
-
-# Import appropriate modules based on version
-PTB_VERSION = get_telegram_bot_version()
-logger.info(f"Detected python-telegram-bot version: {PTB_VERSION}.x")
-
-if PTB_VERSION >= 20:
-    # For version 20.x and above
+# Check Python Telegram Bot version
+try:
+    from telegram import __version__ as ptb_version
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        MessageHandler,
-        CallbackQueryHandler,
-        ContextTypes,
-        filters,
-    )
-    USING_NEW_API = True
-else:
-    # For version 13.x and below
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import (
-        Updater,
-        CommandHandler,
-        MessageHandler,
-        CallbackQueryHandler,
-        CallbackContext,
-        Filters,
-    )
-    USING_NEW_API = False
-    # Alias for compatibility
-    ContextTypes = type('ContextTypes', (), {'DEFAULT_TYPE': CallbackContext})
-    filters = Filters
+    
+    if int(ptb_version.split('.')[0]) >= 20:
+        # For version 20.x and above
+        from telegram.ext import (
+            Application, CommandHandler, CallbackQueryHandler, 
+            MessageHandler, ContextTypes, filters
+        )
+        USING_NEW_API = True
+    else:
+        # For version 13.x
+        from telegram.ext import (
+            Updater, CommandHandler, CallbackQueryHandler, 
+            MessageHandler, Filters, Dispatcher
+        )
+        USING_NEW_API = False
+except ImportError:
+    print("python-telegram-bot package not found. Please install it with: pip install python-telegram-bot")
+    sys.exit(1)
 
-# Import the rest of our modules
+# Import utility modules
+from utils.logger import setup_logger, get_logger
 from utils.database import Database
 from utils.fangen_lore_manager import FangenLoreManager
 from utils.quest_manager import QuestManager
-from utils.callback_utils import create_callback_data, parse_callback_data
-from utils.error_handler import error_handler, ErrorContext, global_error_handler
-from utils.ui_utils import create_styled_button, create_menu_keyboard
+from utils.callback_utils import parse_callback_data, create_callback_data
+from utils.error_handler import error_handler, ErrorContext
+
+# Import command handlers
 from handlers.lore_handlers import LoreCommandHandlers
 from handlers.quest_handlers import QuestCommandHandlers
 
-@error_handler(error_type="general", custom_message="I encountered an issue processing your request. Please try again.")
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued.
-    
-    Welcomes the user to the bot, registers them in the database if they're new,
-    and presents the main menu options.
-    
-    Args:
-        update: The update containing the command
-        context: The context object for the bot
-    """
-    if not update or not update.effective_user:
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("python-dotenv package not found. Using environment variables directly.")
+
+# Configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    print("BOT_TOKEN not found in environment variables. Please set it in .env file or environment.")
+    sys.exit(1)
+
+BOT_NAME = os.getenv('BOT_NAME', 'ZXI')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+
+# Set up logging
+setup_logger(LOG_LEVEL)
+logger = get_logger(__name__)
+
+# Global variables
+ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
+
+# Command handlers
+@error_handler(error_type="command", custom_message="I couldn't process that command. Please try again.")
+async def start_command(update: Update, context: Union[ContextTypes.DEFAULT_TYPE, Any]) -> None:
+    """Handle the /start command."""
+    if not update or not update.message:
+        logger.error("Update or message is None in start_command")
         return
-    
+        
     user = update.effective_user
-    user_id = user.id
-    username = user.username or "Unknown"
+    logger.info(f"User {user.id} ({user.username}) started the bot")
     
     # Get database from context
-    db = context.bot_data.get("db")
-    if not db:
-        await update.message.reply_text("Bot is still initializing. Please try again in a moment.")
-        return
+    db = None
+    if USING_NEW_API:
+        db = context.application.bot_data.get("db")
+    else:
+        db = context.bot_data.get("db")
     
-    # Register user if new
-    with ErrorContext(db):
-        if not db.user_exists(user_id):
-            db.register_user(user_id, username)
-            logger.info(f"New user registered: {username} ({user_id})")
+    if db:
+        # Check if user exists in database
+        if not db.user_exists(user.id):
+            # Register new user
+            db.register_user(user.id, user.username)
+            
+            welcome_message = (
+                f"🌟 *Welcome to {BOT_NAME}, {user.first_name}!* 🌟\n\n"
+                "I'm your guide to the mystical world of Fangen, a realm of elemental forces, "
+                "ancient empires, and legendary beings.\n\n"
+                "Here's what you can do:\n"
+                "• Explore the lore with /lore\n"
+                "• Search for specific information with /search\n"
+                "• Discover random lore with /discover\n"
+                "• Embark on quests with /quests\n"
+                "• View your collection with /collection\n\n"
+                "What would you like to do first?"
+            )
+        else:
+            # Update last active timestamp
+            db.execute_query(
+                "UPDATE users SET last_active = ? WHERE user_id = ?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user.id)
+            )
+            
+            welcome_message = (
+                f"*Welcome back to {BOT_NAME}, {user.first_name}!*\n\n"
+                "What would you like to do today?\n\n"
+                "• Explore the lore with /lore\n"
+                "• Search for specific information with /search\n"
+                "• Discover random lore with /discover\n"
+                "• Embark on quests with /quests\n"
+                "• View your collection with /collection"
+            )
+    else:
+        logger.error("Database not found in context")
+        welcome_message = (
+            f"*Welcome to {BOT_NAME}!*\n\n"
+            "I'm experiencing some technical difficulties at the moment. "
+            "Please try again later."
+        )
     
-    # Welcome message
-    welcome_text = (
-        f"🌟 *Welcome to the World of Fangen, {user.first_name}!* 🌟\n\n"
-        "I am your guide to the mystical realm where ancient traditions and "
-        "elemental powers shape the destiny of all beings.\n\n"
-        "Here you can:\n"
-        "• Explore the rich lore of Fangen\n"
-        "• Embark on quests across the realm\n"
-        "• Craft powerful items with mystical properties\n"
-        "• Interact with the inhabitants of this world\n\n"
-        "What would you like to do first?"
-    )
+    # Create keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📚 Explore Lore", callback_data=create_callback_data("lore_menu")),
+            InlineKeyboardButton("🔍 Search", callback_data=create_callback_data("search_menu"))
+        ],
+        [
+            InlineKeyboardButton("🎲 Discover", callback_data=create_callback_data("lore_discover")),
+            InlineKeyboardButton("⚔️ Quests", callback_data=create_callback_data("quest_menu"))
+        ],
+        [
+            InlineKeyboardButton("📋 Collection", callback_data=create_callback_data("lore_collection")),
+            InlineKeyboardButton("❓ Help", callback_data=create_callback_data("help_menu"))
+        ]
+    ])
     
-    # Create menu keyboard
-    menu_items = [
-        ("📚 Explore Lore", create_callback_data("lore_menu"), "primary"),
-        ("🗺️ View Quests", create_callback_data("quest_menu"), "primary"),
-        ("👥 Meet Characters", create_callback_data("character_menu"), "secondary"),
-        ("🔍 Search Knowledge", create_callback_data("search_menu"), "secondary")
-    ]
-    
-    keyboard = create_menu_keyboard(menu_items)
-    
-    # Send welcome message with menu
     await update.message.reply_text(
-        welcome_text,
+        welcome_message,
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode='Markdown'
     )
 
-@error_handler(error_type="general", custom_message="I encountered an issue processing your help request.")
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued.
-    
-    Provides information about available commands and how to use the bot.
-    
-    Args:
-        update: The update containing the command
-        context: The context object for the bot
-    """
+@error_handler(error_type="command", custom_message="I couldn't process that command. Please try again.")
+async def help_command(update: Update, context: Union[ContextTypes.DEFAULT_TYPE, Any]) -> None:
+    """Handle the /help command."""
     if not update or not update.message:
+        logger.error("Update or message is None in help_command")
         return
-    
+        
     help_text = (
-        "*ZXI: Your Guide to Fangen*\n\n"
-        "Here are the commands you can use:\n\n"
-        "*Basic Commands:*\n"
-        "/start - Begin your journey or return to the main menu\n"
-        "/help - Display this help message\n\n"
+        f"*{BOT_NAME} Help Guide*\n\n"
+        "*Basic Commands*\n"
+        "• /start - Begin your journey or return to the main menu\n"
+        "• /help - Display this help message\n\n"
         
-        "*Lore Commands:*\n"
-        "/lore - Explore the world of Fangen\n"
-        "/search [term] - Search for specific lore\n"
-        "/discover - Find random lore entries\n"
-        "/collection - View your discovered lore\n\n"
+        "*Lore Commands*\n"
+        "• /lore - Explore the world of Fangen\n"
+        "• /search [term] - Search for specific lore\n"
+        "• /discover - Find random lore entries\n"
+        "• /collection - View your discovered lore\n\n"
         
-        "*Quest Commands:*\n"
-        "/quests - View available quests\n"
-        "/quest [name] - Start or continue a specific quest\n"
-        "/active - See your active quests\n"
-        "/inventory - Check your items\n"
-        "/craft - Craft new items\n"
-        "/characters - View characters you've met\n"
-        "/interact [character] - Interact with a character\n\n"
+        "*Quest Commands*\n"
+        "• /quests - View available quests\n"
+        "• /quest [name] - Start or continue a specific quest\n"
+        "• /active - See your active quests\n"
+        "• /inventory - Check your items\n"
+        "• /craft - Craft new items\n"
+        "• /characters - View characters you've met\n"
+        "• /interact [character] - Interact with a character\n\n"
         
-        "You can also tap buttons and links to navigate through the bot."
+        "For more detailed help on a specific feature, use the buttons below:"
     )
+    
+    # Create keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📚 Lore Help", callback_data=create_callback_data("help_lore")),
+            InlineKeyboardButton("⚔️ Quest Help", callback_data=create_callback_data("help_quests"))
+        ],
+        [
+            InlineKeyboardButton("🧰 Inventory Help", callback_data=create_callback_data("help_inventory")),
+            InlineKeyboardButton("👥 Character Help", callback_data=create_callback_data("help_characters"))
+        ],
+        [
+            InlineKeyboardButton("🏠 Main Menu", callback_data=create_callback_data("main_menu"))
+        ]
+    ])
     
     await update.message.reply_text(
         help_text,
-        parse_mode="Markdown"
+        reply_markup=keyboard,
+        parse_mode='Markdown'
     )
 
-@error_handler(error_type="callback", custom_message="I couldn't process that action. Please try again.")
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle callback queries from inline keyboards.
-    
-    Routes the callback to the appropriate handler based on the action.
-    
-    Args:
-        update: The update containing the callback query
-        context: The context object for the bot
-    """
-    if not update or not update.callback_query:
+@error_handler(error_type="callback", custom_message="I couldn't process that button press. Please try again.")
+async def handle_callback(update: Update, context: Union[ContextTypes.DEFAULT_TYPE, Any]) -> None:
+    """Handle callback queries."""
+    if not update or not update.callback_query or not update.effective_user:
+        logger.error("Update, callback_query, or effective_user is None in handle_callback")
         return
+        
+    query = update.callback_query
     
-    # Store the last action for retry functionality
-    if not hasattr(context, 'user_data'):
-        context.user_data = {}
-    
-    callback_query = update.callback_query
-    
+    # Parse callback data
     try:
-        # Parse the callback data
-        callback_data = parse_callback_data(callback_query.data)
-        
-        # Store for retry
-        context.user_data['last_callback'] = callback_query.data
-        
-        # Get the action
+        callback_data = parse_callback_data(query.data)
         action = callback_data.get("action", "")
-        
-        # Get handlers from context
-        lore_handlers = context.bot_data.get("lore_handlers")
-        quest_handlers = context.bot_data.get("quest_handlers")
-        
-        if not lore_handlers or not quest_handlers:
-            await callback_query.answer("Bot is still initializing. Please try again in a moment.")
-            return
-        
-        # Route to appropriate handler based on action prefix
-        if action.startswith("lore"):
-            await lore_handlers.handle_callback(update, context, callback_data)
-        elif action.startswith("quest"):
-            await quest_handlers.handle_callback(update, context, callback_data)
-        elif action == "character_menu":
-            await quest_handlers.characters_menu(update, context)
-        elif action == "search_menu":
-            await lore_handlers.search_menu(update, context)
-        elif action == "retry":
-            # Retry last action
-            last_callback = context.user_data.get('last_callback')
-            if last_callback and last_callback != callback_query.data:
-                # Create a new callback query with the last action
-                callback_query.data = last_callback
-                await handle_callback(update, context)
-            else:
-                await callback_query.answer("No previous action to retry.")
-        else:
-            # Unknown action
-            logger.warning(f"Unknown callback action: {action}")
-            await callback_query.answer("I don't recognize that action.")
     except Exception as e:
-        logger.error(f"Error handling callback: {e}", exc_info=True)
-        await callback_query.answer("An error occurred. Please try again.")
-
-@error_handler(error_type="message", custom_message="I couldn't process your message. Please try again.")
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle non-command messages.
-    
-    Processes natural language input and routes to appropriate handlers.
-    
-    Args:
-        update: The update containing the message
-        context: The context object for the bot
-    """
-    if not update or not update.message or not update.effective_user:
+        logger.error(f"Failed to parse callback data: {e}")
+        await query.answer("Invalid callback data")
         return
-    
-    user_id = update.effective_user.id
-    message_text = update.message.text
     
     # Get handlers from context
-    lore_handlers = context.bot_data.get("lore_handlers")
-    quest_handlers = context.bot_data.get("quest_handlers")
+    lore_handlers = None
+    quest_handlers = None
     
-    if not lore_handlers or not quest_handlers:
-        await update.message.reply_text("Bot is still initializing. Please try again in a moment.")
-        return
-    
-    # Check if user is in a conversation state
-    db = context.bot_data.get("db")
-    if not db:
-        await update.message.reply_text("Bot is still initializing. Please try again in a moment.")
-        return
-    
-    with ErrorContext(db):
-        user_state = db.get_user_state(user_id)
-    
-    # Route based on user state
-    if user_state and "quest_active" in user_state and user_state["quest_active"]:
-        # User is in an active quest, route to quest handler
-        await quest_handlers.handle_quest_input(update, context)
-    elif user_state and "character_interaction" in user_state and user_state["character_interaction"]:
-        # User is interacting with a character, route to character handler
-        await quest_handlers.handle_character_input(update, context)
+    if USING_NEW_API:
+        lore_handlers = context.application.bot_data.get("lore_handlers")
+        quest_handlers = context.application.bot_data.get("quest_handlers")
     else:
-        # Try to interpret as a search query
-        if len(message_text.split()) > 1:  # More than one word, likely a search
-            await lore_handlers.search_command(update, context)
-        else:
-            # Default response
-            await update.message.reply_text(
-                "I'm not sure what you're asking. Try using a command like /help to see what I can do."
-            )
-
-# Initialize bot components
-async def post_init(application):
-    """Initialize bot components after the application is built.
+        lore_handlers = context.bot_data.get("lore_handlers")
+        quest_handlers = context.bot_data.get("quest_handlers")
     
-    Args:
-        application: The application instance
-    """
+    # Route to appropriate handler
     try:
-        logger.info("Initializing bot components...")
+        if action.startswith("lore_"):
+            if lore_handlers:
+                await lore_handlers.handle_callback(update, context, callback_data)
+            else:
+                logger.error("lore_handlers not found in context")
+                await query.answer("Lore handlers not available")
+        elif action.startswith("quest_"):
+            if quest_handlers:
+                await quest_handlers.handle_callback(update, context, callback_data)
+            else:
+                logger.error("quest_handlers not found in context")
+                await query.answer("Quest handlers not available")
+        elif action.startswith("search_"):
+            if lore_handlers:
+                await lore_handlers.handle_callback(update, context, callback_data)
+            else:
+                logger.error("lore_handlers not found in context")
+                await query.answer("Search handlers not available")
+        elif action.startswith("help_"):
+            await query.answer("Opening help section")
+            await handle_help_callback(update, context, callback_data)
+        elif action == "main_menu":
+            await query.answer("Returning to main menu")
+            # Create a fake update to reuse the start_command
+            await start_command(update, context)
+        else:
+            logger.warning(f"Unknown callback action: {action}")
+            await query.answer("Unknown action")
+    except Exception as e:
+        logger.error(f"Error handling callback: {e}")
+        await query.answer("Error processing your request")
+
+async def handle_help_callback(update: Update, context: Union[ContextTypes.DEFAULT_TYPE, Any], callback_data: Dict[str, Any]) -> None:
+    """Handle help-related callbacks."""
+    if not update or not update.callback_query:
+        logger.error("Update or callback_query is None in handle_help_callback")
+        return
         
+    query = update.callback_query
+    action = callback_data.get("action", "")
+    
+    # Help text based on action
+    if action == "help_lore":
+        help_text = (
+            "*Lore Help*\n\n"
+            "The world of Fangen is rich with lore, history, and mysteries to discover.\n\n"
+            "*Commands:*\n"
+            "• /lore - Browse lore categories\n"
+            "• /search [term] - Search for specific lore entries\n"
+            "• /discover - Find random lore entries\n"
+            "• /collection - View your discovered lore\n\n"
+            
+            "*Tips:*\n"
+            "• Use specific search terms for better results\n"
+            "• Discover new lore regularly to build your collection\n"
+            "• Some lore is only revealed through quests or character interactions"
+        )
+    elif action == "help_quests":
+        help_text = (
+            "*Quest Help*\n\n"
+            "Embark on adventures throughout Fangen, make choices, and shape your destiny.\n\n"
+            "*Commands:*\n"
+            "• /quests - View available quests\n"
+            "• /quest [name] - Start or continue a specific quest\n"
+            "• /active - See your active quests\n\n"
+            
+            "*Tips:*\n"
+            "• Your choices affect quest outcomes\n"
+            "• Some quests require specific items or lore knowledge\n"
+            "• Quests may unlock new characters, items, or lore"
+        )
+    elif action == "help_inventory":
+        help_text = (
+            "*Inventory Help*\n\n"
+            "Collect items, craft new ones, and use them in your adventures.\n\n"
+            "*Commands:*\n"
+            "• /inventory - View your collected items\n"
+            "• /craft - View available crafting recipes\n"
+            "• /craft [item] - Craft a specific item\n\n"
+            
+            "*Tips:*\n"
+            "• Items can be found during quests\n"
+            "• Some items are required for specific quests\n"
+            "• Rare items can be crafted from common ones"
+        )
+    elif action == "help_characters":
+        help_text = (
+            "*Character Help*\n\n"
+            "Meet and interact with the inhabitants of Fangen.\n\n"
+            "*Commands:*\n"
+            "• /characters - View characters you've met\n"
+            "• /interact - Speak with characters from Fangen\n"
+            "• /interact [name] - Speak with a specific character\n\n"
+            
+            "*Tips:*\n"
+            "• Characters remember your interactions\n"
+            "• Building relationships can unlock new quests\n"
+            "• Characters may provide hints about lore and quests"
+        )
+    else:
+        help_text = "Help section not found."
+    
+    # Create keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("« Back to Help", callback_data=create_callback_data("help_menu")),
+            InlineKeyboardButton("🏠 Main Menu", callback_data=create_callback_data("main_menu"))
+        ]
+    ])
+    
+    await query.edit_message_text(
+        help_text,
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+async def post_init(application: Application) -> None:
+    """Post-initialization setup for the application."""
+    logger.info("Performing post-initialization setup")
+    
+    try:
         # Initialize database
         db = Database()
         application.bot_data["db"] = db
@@ -307,7 +366,7 @@ async def post_init(application):
         application.bot_data["lore_manager"] = lore_manager
         
         # Initialize quest manager
-        quest_manager = QuestManager(db)
+        quest_manager = QuestManager(db, lore_manager)
         application.bot_data["quest_manager"] = quest_manager
         
         # Initialize handlers with dependencies
@@ -319,7 +378,7 @@ async def post_init(application):
         
         logger.info("Bot components initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize bot components: {e}")
+        logger.error(f"Error in post_init: {e}")
         raise
 
 def main() -> None:
@@ -328,24 +387,40 @@ def main() -> None:
         if USING_NEW_API:
             # For version 20.x and above - Use Application
             logger.info("Using python-telegram-bot v20+ API")
+            
+            # Initialize database and managers first
+            db = Database()
+            lore_manager = FangenLoreManager()
+            quest_manager = QuestManager(db, lore_manager)
+            
+            # Initialize handlers with proper dependencies
+            lore_handlers = LoreCommandHandlers(db, lore_manager)
+            quest_handlers = QuestCommandHandlers(db, quest_manager, lore_manager)
+            
+            # Build application with post_init for additional setup
             application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+            
+            # Store components in bot_data for access in handlers
+            application.bot_data["db"] = db
+            application.bot_data["lore_manager"] = lore_manager
+            application.bot_data["quest_manager"] = quest_manager
+            application.bot_data["lore_handlers"] = lore_handlers
+            application.bot_data["quest_handlers"] = quest_handlers
             
             # Add command handlers
             application.add_handler(CommandHandler("start", start_command))
             application.add_handler(CommandHandler("help", help_command))
             
             # Add lore command handlers
-            lore_handlers = LoreCommandHandlers(None, None)  # Will be properly initialized in post_init
             application.add_handler(CommandHandler("lore", lore_handlers.lore_command))
             application.add_handler(CommandHandler("search", lore_handlers.search_command))
             application.add_handler(CommandHandler("discover", lore_handlers.discover_command))
             application.add_handler(CommandHandler("collection", lore_handlers.collection_command))
             
             # Add quest command handlers
-            quest_handlers = QuestCommandHandlers(None, None, None)  # Will be properly initialized in post_init
             application.add_handler(CommandHandler("quests", quest_handlers.quests_command))
             application.add_handler(CommandHandler("quest", quest_handlers.quest_command))
-            application.add_handler(CommandHandler("active", quest_handlers.active_quests_command))
+            application.add_handler(CommandHandler("active", quest_handlers.active_command))
             application.add_handler(CommandHandler("inventory", quest_handlers.inventory_command))
             application.add_handler(CommandHandler("craft", quest_handlers.craft_command))
             application.add_handler(CommandHandler("characters", quest_handlers.characters_command))
@@ -354,19 +429,18 @@ def main() -> None:
             # Add callback query handler
             application.add_handler(CallbackQueryHandler(handle_callback))
             
-            # Add message handler for non-command messages
-            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            
-            # Add error handler
-            application.add_error_handler(global_error_handler)
-            
-            # Start the Bot
-            logger.info("Starting bot with Application API...")
+            # Start the bot
+            logger.info("Starting bot")
             application.run_polling()
+            
         else:
-            # For version 13.x and below - Use Updater
-            logger.info("Using python-telegram-bot v13 API")
+            # For version 13.x - Use Updater
+            logger.info("Using python-telegram-bot v13.x API")
+            
+            # Create the Updater and pass it your bot's token
             updater = Updater(BOT_TOKEN)
+            
+            # Get the dispatcher to register handlers
             dispatcher = updater.dispatcher
             
             # Initialize bot components
@@ -376,7 +450,7 @@ def main() -> None:
             lore_manager = FangenLoreManager()
             dispatcher.bot_data["lore_manager"] = lore_manager
             
-            quest_manager = QuestManager(db)
+            quest_manager = QuestManager(db, lore_manager)
             dispatcher.bot_data["quest_manager"] = quest_manager
             
             lore_handlers = LoreCommandHandlers(db, lore_manager)
@@ -398,7 +472,7 @@ def main() -> None:
             # Add quest command handlers
             dispatcher.add_handler(CommandHandler("quests", quest_handlers.quests_command))
             dispatcher.add_handler(CommandHandler("quest", quest_handlers.quest_command))
-            dispatcher.add_handler(CommandHandler("active", quest_handlers.active_quests_command))
+            dispatcher.add_handler(CommandHandler("active", quest_handlers.active_command))
             dispatcher.add_handler(CommandHandler("inventory", quest_handlers.inventory_command))
             dispatcher.add_handler(CommandHandler("craft", quest_handlers.craft_command))
             dispatcher.add_handler(CommandHandler("characters", quest_handlers.characters_command))
@@ -407,18 +481,15 @@ def main() -> None:
             # Add callback query handler
             dispatcher.add_handler(CallbackQueryHandler(handle_callback))
             
-            # Add message handler for non-command messages
-            dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-            
-            # Add error handler
-            dispatcher.add_error_handler(global_error_handler)
-            
-            # Start the Bot
-            logger.info("Starting bot with Updater API...")
+            # Start the bot
+            logger.info("Starting bot")
             updater.start_polling()
+            
+            # Run the bot until you press Ctrl-C
             updater.idle()
+            
     except Exception as e:
-        logger.critical(f"Failed to start bot: {e}")
+        logger.error(f"Error starting bot: {e}")
         sys.exit(1)
 
 if __name__ == '__main__':

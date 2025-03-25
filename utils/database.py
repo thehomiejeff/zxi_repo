@@ -10,6 +10,7 @@ import os
 import sqlite3
 import json
 from typing import Dict, List, Tuple, Any, Optional
+from datetime import datetime
 
 from utils.logger import get_logger
 from config import DB_TYPE, DB_NAME, DB_HOST, DB_PORT, DB_USER, DB_PASSWORD
@@ -46,6 +47,9 @@ class Database:
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             logger.info(f"Connected to SQLite database: {db_path}")
+            
+            # Initialize tables if they don't exist
+            self._initialize_tables()
         except Exception as e:
             logger.error(f"Error connecting to SQLite database: {e}", exc_info=True)
     
@@ -56,263 +60,291 @@ class Database:
             from psycopg2.extras import RealDictCursor
             
             self.conn = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                database=DB_NAME,
+                dbname=self.db_name,
                 user=DB_USER,
-                password=DB_PASSWORD
+                password=DB_PASSWORD,
+                host=DB_HOST,
+                port=DB_PORT
             )
-            logger.info(f"Connected to PostgreSQL database: {DB_NAME}")
-        except ImportError:
-            logger.error("psycopg2 not installed. Install it to use PostgreSQL.")
+            logger.info(f"Connected to PostgreSQL database: {self.db_name} on {DB_HOST}:{DB_PORT}")
+            
+            # Initialize tables if they don't exist
+            self._initialize_tables()
         except Exception as e:
             logger.error(f"Error connecting to PostgreSQL database: {e}", exc_info=True)
     
-    def setup(self):
-        """Set up the database tables."""
-        if not self.conn:
-            logger.error("Database connection not established")
-            return
-        
+    def _initialize_tables(self):
+        """Initialize database tables if they don't exist."""
         try:
             cursor = self.conn.cursor()
             
             # Create users table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    settings TEXT
-                )
-            ''')
-            
-            # Create interactions table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS interactions (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    character TEXT,
-                    message TEXT,
-                    response TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            # Create user_progress table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_progress (
-                    user_id INTEGER,
-                    category TEXT,
-                    item_name TEXT,
-                    discovered BOOLEAN DEFAULT FALSE,
-                    discovery_date TIMESTAMP,
-                    notes TEXT,
-                    PRIMARY KEY (user_id, category, item_name),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                discovered_lore TEXT DEFAULT '[]',
+                state TEXT DEFAULT '{}'
+            )
             ''')
             
             # Create user_inventory table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_inventory (
-                    user_id INTEGER,
-                    item_name TEXT,
-                    rarity TEXT DEFAULT 'Normal',
-                    quantity INTEGER DEFAULT 1,
-                    acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, item_name),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
+            CREATE TABLE IF NOT EXISTS user_inventory (
+                user_id INTEGER,
+                item_name TEXT,
+                quantity INTEGER DEFAULT 1,
+                acquired_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, item_name),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
             ''')
             
-            # Create quest_logs table
+            # Create user_quests table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS quest_logs (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    quest_name TEXT,
-                    status TEXT, -- 'in_progress', 'completed', 'abandoned'
-                    started_at TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    choices_made TEXT, -- JSON string of choices
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
+            CREATE TABLE IF NOT EXISTS user_quests (
+                user_id INTEGER,
+                quest_name TEXT,
+                status TEXT DEFAULT 'active',
+                current_scene INTEGER DEFAULT 1,
+                started_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_date TIMESTAMP,
+                PRIMARY KEY (user_id, quest_name),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+            ''')
+            
+            # Create user_progress table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_progress (
+                user_id INTEGER,
+                category TEXT,
+                item_name TEXT,
+                discovered BOOLEAN DEFAULT FALSE,
+                discovery_date TIMESTAMP,
+                PRIMARY KEY (user_id, category, item_name),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+            ''')
+            
+            # Create user_relationships table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_relationships (
+                user_id INTEGER,
+                character_name TEXT,
+                affinity INTEGER DEFAULT 0,
+                first_met TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, character_name),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
             ''')
             
             # Create decision_logs table
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS decision_logs (
-                    id INTEGER PRIMARY KEY,
-                    user_id INTEGER,
-                    quest_name TEXT,
-                    scene_id TEXT,
-                    choice_id TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
+            CREATE TABLE IF NOT EXISTS decision_logs (
+                user_id INTEGER,
+                quest_name TEXT,
+                scene_id TEXT,
+                choice_id TEXT,
+                decision_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, quest_name, scene_id, choice_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
             ''')
             
-            # Create crafting_recipes table
+            # Create crafting_recipes table if it doesn't exist
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS crafting_recipes (
-                    id INTEGER PRIMARY KEY,
-                    result_item TEXT,
-                    result_rarity TEXT,
-                    requirements TEXT, -- JSON string of required items
-                    quest_requirements TEXT, -- JSON string of required quest completions or choices
-                    description TEXT
-                )
-            ''')
-            
-            # Create character_relationships table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS character_relationships (
-                    user_id INTEGER,
-                    character_name TEXT,
-                    relationship_level INTEGER DEFAULT 0,
-                    last_interaction TIMESTAMP,
-                    notes TEXT,
-                    PRIMARY KEY (user_id, character_name),
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
+            CREATE TABLE IF NOT EXISTS crafting_recipes (
+                result_item TEXT PRIMARY KEY,
+                result_rarity TEXT DEFAULT 'common',
+                requirements TEXT DEFAULT '{}',
+                quest_requirements TEXT DEFAULT '{}'
+            )
             ''')
             
             self.conn.commit()
-            logger.info("Database tables set up successfully")
-            
-            # Add initial crafting recipes
-            self._add_initial_recipes()
-            
+            logger.info("Database tables initialized successfully")
         except Exception as e:
-            logger.error(f"Error setting up database tables: {e}", exc_info=True)
-    
-    def _add_initial_recipes(self):
-        """Add initial crafting recipes based on lore."""
-        recipes = [
-            {
-                "result_item": "Inferno Fang",
-                "result_rarity": "Rare",
-                "requirements": json.dumps({"Emberdust Vial": 1, "Relic Shard": 1}),
-                "quest_requirements": json.dumps({"The Ember's Awakening": {"scene3": "3A"}}),
-                "description": "A blazing weapon forged from the essence of fire."
-            },
-            {
-                "result_item": "Enhanced Inferno Fang",
-                "result_rarity": "Rare",
-                "requirements": json.dumps({"Emberdust Vial": 1, "Relic Shard": 1, "Data Chip": 1, "Secret Note": 1}),
-                "quest_requirements": json.dumps({"The Ember's Awakening": {"scene3": "3B"}}),
-                "description": "An enhanced version of the Inferno Fang with the 'Ember Surge' ability."
-            },
-            {
-                "result_item": "Solar Fang",
-                "result_rarity": "Legendary",
-                "requirements": json.dumps({"Diamond Shard": 1, "Mystic Fragment": 1, "Visionary Pendant": 1}),
-                "quest_requirements": json.dumps({"The Shattered Relics of Fate": {"scene4": "4A"}}),
-                "description": "A legendary weapon that radiates with the unified power of all elemental forces."
-            },
-            {
-                "result_item": "Paper's Edge",
-                "result_rarity": "Rare",
-                "requirements": json.dumps({"Paper Fragment": 2}),
-                "quest_requirements": json.dumps({}),
-                "description": "A razor-sharp weapon crafted from the essence of the Paper element."
-            },
-            {
-                "result_item": "Ape's Wrath",
-                "result_rarity": "Normal",
-                "requirements": json.dumps({}),
-                "quest_requirements": json.dumps({}),
-                "description": "A basic weapon that embodies the raw physical power of the Ape element."
-            }
-        ]
-        
-        try:
-            cursor = self.conn.cursor()
-            
-            for recipe in recipes:
-                # Check if recipe already exists
-                existing = self.execute_query(
-                    "SELECT id FROM crafting_recipes WHERE result_item = ?",
-                    (recipe["result_item"],)
-                )
-                
-                if not existing:
-                    cursor.execute(
-                        "INSERT INTO crafting_recipes (result_item, result_rarity, requirements, quest_requirements, description) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (recipe["result_item"], recipe["result_rarity"], recipe["requirements"], 
-                         recipe["quest_requirements"], recipe["description"])
-                    )
-            
-            self.conn.commit()
-            logger.info("Initial crafting recipes added successfully")
-        except Exception as e:
-            logger.error(f"Error adding initial recipes: {e}", exc_info=True)
-    
-    def execute_query(self, query: str, params: Tuple = ()) -> Optional[List[Dict]]:
-        """Execute a database query.
-        
-        Args:
-            query: SQL query string to execute
-            params: Parameters to bind to the query
-            
-        Returns:
-            List of dictionaries containing query results for SELECT queries,
-            None for other query types or if an error occurs
-        """
-        if not self.conn:
-            logger.error("Database connection not established")
-            return None
-        
-        cursor = None
-        try:
-            # Use a lock to prevent race conditions in concurrent access
-            cursor = self.conn.cursor()
-            cursor.execute(query, params)
-            
-            if query.strip().upper().startswith(("SELECT", "PRAGMA")):
-                if self.db_type == "sqlite":
-                    results = [dict(row) for row in cursor.fetchall()]
-                else:
-                    results = cursor.fetchall()
-                return results
-            else:
-                self.conn.commit()
-                return None
-        except sqlite3.Error as e:
-            logger.error(f"SQLite error executing query: {e}", exc_info=True)
-            # Rollback transaction on error
-            if self.conn:
-                self.conn.rollback()
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error executing query: {e}", exc_info=True)
-            # Rollback transaction on error
-            if self.conn:
-                self.conn.rollback()
-            return None
-        finally:
-            # Close cursor if it was created
-            if cursor:
-                cursor.close()
+            logger.error(f"Error initializing database tables: {e}", exc_info=True)
     
     def close(self):
-        """Close the database connection.
-        
-        Properly closes the database connection and releases resources.
-        Should be called when the application is shutting down.
-        """
+        """Close the database connection."""
         if self.conn:
             try:
                 self.conn.close()
                 logger.info("Database connection closed successfully")
             except Exception as e:
                 logger.error(f"Error closing database connection: {e}", exc_info=True)
+    
+    def execute_query(self, query: str, params: tuple = ()) -> List[Dict]:
+        """Execute a database query.
+        
+        Args:
+            query: SQL query to execute
+            params: Parameters for the query
+            
+        Returns:
+            List of dictionaries containing query results
+        """
+        if not self.conn:
+            logger.error("No database connection available")
+            return []
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            
+            # Check if this is a SELECT query
+            if query.strip().upper().startswith("SELECT"):
+                if self.db_type == "sqlite":
+                    # For SQLite, convert Row objects to dictionaries
+                    results = [dict(row) for row in cursor.fetchall()]
+                else:
+                    # For PostgreSQL, results are already dictionaries
+                    results = cursor.fetchall()
+                
+                return results
+            else:
+                # For non-SELECT queries, commit and return empty list
+                self.conn.commit()
+                return []
+        except Exception as e:
+            logger.error(f"Database error executing query: {e}", exc_info=True)
+            return []
+    
+    def user_exists(self, user_id: int) -> bool:
+        """Check if a user exists in the database.
+        
+        Args:
+            user_id: The user ID to check
+            
+        Returns:
+            True if the user exists, False otherwise
+        """
+        try:
+            result = self.execute_query(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            return len(result) > 0
+        except Exception as e:
+            logger.error(f"Error checking if user exists: {e}", exc_info=True)
+            return False
+    
+    def register_user(self, user_id: int, username: str) -> bool:
+        """Register a new user in the database.
+        
+        Args:
+            user_id: The user ID to register
+            username: The username to register
+            
+        Returns:
+            True if registration was successful, False otherwise
+        """
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.execute_query(
+                "INSERT INTO users (user_id, username, first_seen, last_active) VALUES (?, ?, ?, ?)",
+                (user_id, username, current_time, current_time)
+            )
+            logger.info(f"Registered new user: {username} ({user_id})")
+            return True
+        except Exception as e:
+            logger.error(f"Error registering user: {e}", exc_info=True)
+            return False
+    
+    def update_user_activity(self, user_id: int) -> bool:
+        """Update the last_active timestamp for a user.
+        
+        Args:
+            user_id: The user ID to update
+            
+        Returns:
+            True if update was successful, False otherwise
+        """
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.execute_query(
+                "UPDATE users SET last_active = ? WHERE user_id = ?",
+                (current_time, user_id)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating user activity: {e}", exc_info=True)
+            return False
+    
+    def get_user_state(self, user_id: int) -> Dict:
+        """Get the current state for a user.
+        
+        Args:
+            user_id: The user ID to get state for
+            
+        Returns:
+            Dictionary containing user state
+        """
+        try:
+            result = self.execute_query(
+                "SELECT state FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            if result and 'state' in result[0]:
+                state_str = result[0]['state']
+                if state_str:
+                    return json.loads(state_str)
+            
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting user state: {e}", exc_info=True)
+            return {}
+    
+    def set_user_state(self, user_id: int, state: Dict) -> bool:
+        """Set the state for a user.
+        
+        Args:
+            user_id: The user ID to set state for
+            state: Dictionary containing user state
+            
+        Returns:
+            True if update was successful, False otherwise
+        """
+        try:
+            state_str = json.dumps(state)
+            self.execute_query(
+                "UPDATE users SET state = ? WHERE user_id = ?",
+                (state_str, user_id)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error setting user state: {e}", exc_info=True)
+            return False
+    
+    def update_user_state(self, user_id: int, key: str, value: Any) -> bool:
+        """Update a specific key in the user's state.
+        
+        Args:
+            user_id: The user ID to update state for
+            key: The state key to update
+            value: The new value for the key
+            
+        Returns:
+            True if update was successful, False otherwise
+        """
+        try:
+            # Get current state
+            current_state = self.get_user_state(user_id)
+            
+            # Update the key
+            current_state[key] = value
+            
+            # Save updated state
+            return self.set_user_state(user_id, current_state)
+        except Exception as e:
+            logger.error(f"Error updating user state: {e}", exc_info=True)
+            return False
     
     def can_craft_item(self, user_id: int, item_name: str) -> Tuple[bool, str, Dict]:
         """Check if a user can craft a specific item.

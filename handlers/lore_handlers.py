@@ -2,402 +2,407 @@
 # -*- coding: utf-8 -*-
 
 """
-Command handlers for lore-related features
+Lore command handlers for ZXI Bot
+Handles lore browsing, searching, and discovery
 """
 
 import logging
-import random
 import json
-from typing import Dict, List, Any, Optional, Tuple
+import random
+from typing import Dict, List, Any, Tuple, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from utils.logger import get_logger
-from utils.fangen_lore_manager import FangenLoreManager
-from utils.database import Database
-from utils.callback_utils import (
-    create_callback_data, 
-    parse_callback_data, 
-    validate_callback_data,
-    lore_reference_manager,
-    create_lore_category_callback,
-    create_lore_entry_callback,
-    create_navigation_callback
-)
-from utils.error_handler import error_handler, ErrorContext
-from utils.ui_utils import (
-    create_styled_button,
-    optimize_button_layout,
-    create_paginated_keyboard,
-    create_menu_keyboard
-)
-from config import BOT_NAME, MAX_SEARCH_RESULTS
+from utils.callback_utils import create_callback_data, parse_callback_data
+from utils.error_handler import error_handler
+from utils.ui_utils import create_styled_button, create_menu_keyboard, create_paginated_keyboard
 
-logger = get_logger(__name__)
+# Set up logging
+logger = logging.getLogger(__name__)
+
+# Helper functions for callback data creation
+def create_lore_category_callback(category: str) -> str:
+    """Create callback data for a lore category."""
+    return create_callback_data("lore_category", {"name": category})
+
+def create_lore_entry_callback(entry_name: str) -> str:
+    """Create callback data for a lore entry."""
+    return create_callback_data("lore_entry", {"name": entry_name})
 
 class LoreCommandHandlers:
-    """Command handlers for lore-related features."""
+    """Handlers for lore-related commands."""
     
-    def __init__(self, lore_manager: FangenLoreManager, db: Database):
-        """Initialize lore command handlers."""
-        self.lore_manager = lore_manager
+    def __init__(self, db, lore_manager):
+        """Initialize the lore command handlers.
+        
+        Args:
+            db: Database instance
+            lore_manager: FangenLoreManager instance
+        """
         self.db = db
+        self.lore_manager = lore_manager
     
-    @error_handler(error_type="general", custom_message="I couldn't access the lore categories. Please try again.")
+    @error_handler(error_type="command", custom_message="I couldn't access the lore. Please try again.")
     async def lore_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /lore command to browse lore by category."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in lore_command")
+        """Handle the /lore command to browse lore categories.
+        
+        Args:
+            update: The update containing the command
+            context: The context object for the bot
+        """
+        if not update or not update.message:
+            logger.error("Update or message is None in lore_command")
+            return
+            
+        # Get lore categories
+        try:
+            categories = self.lore_manager.get_categories()
+            
+            if not categories:
+                await update.message.reply_text("No lore categories found.")
+                return
+            
+            # Create buttons for categories
+            category_items = []
+            for category in categories:
+                callback_data = create_lore_category_callback(category)
+                category_items.append((category.capitalize(), callback_data, "primary"))
+            
+            # Create keyboard with optimized layout
+            keyboard = create_menu_keyboard(category_items)
+            
+            # Send message with category menu
+            await update.message.reply_text(
+                "📚 *Explore the Lore of Fangen* 📚\n\n"
+                "Select a category to browse:",
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error getting lore categories: {e}")
+            await update.message.reply_text("I encountered an error accessing the lore. Please try again.")
+    
+    @error_handler(error_type="command", custom_message="I couldn't search the lore. Please try again.")
+    async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /search command to search for lore entries.
+        
+        Args:
+            update: The update containing the command
+            context: The context object for the bot
+        """
+        if not update or not update.message:
+            logger.error("Update or message is None in search_command")
+            return
+            
+        # Check if a search term was provided
+        if context.args and len(context.args) > 0:
+            # Join all arguments into a single search term
+            search_term = " ".join(context.args).lower()
+            
+            # Perform search
+            try:
+                results = self.lore_manager.search_lore(search_term)
+                
+                # Check if any results were found
+                total_results = sum(len(category_results) for category_results in results.values())
+                
+                if total_results == 0:
+                    await update.message.reply_text(
+                        f"No results found for '{search_term}'.\n\n"
+                        "Try a different search term or browse the lore categories with /lore."
+                    )
+                    return
+                
+                # Create message with search results
+                message_text = f"🔍 *Search Results for '{search_term}'* 🔍\n\n"
+                
+                # Create buttons for results
+                result_items = []
+                
+                # Add results from each category
+                for category, category_results in results.items():
+                    if category_results:
+                        for name, snippet in category_results:
+                            callback_data = create_callback_data("lore_entry", {"name": name, "category": category})
+                            result_items.append((f"{name} ({category.capitalize()})", callback_data, "secondary"))
+                
+                # Create paginated keyboard
+                keyboard, total_pages, current_page = create_paginated_keyboard(
+                    result_items,
+                    page=0,
+                    items_per_page=10,
+                    show_pagination=True
+                )
+                
+                # Add back button
+                back_button = create_styled_button("« Back to Lore", create_callback_data("lore_back"), "back")
+                keyboard.inline_keyboard.append([back_button])
+                
+                # Add result count to message
+                message_text += f"Found {total_results} results across {len([c for c, r in results.items() if r])} categories.\n\n"
+                message_text += "Select an entry to view details:"
+                
+                # Send message with results
+                await update.message.reply_text(
+                    message_text,
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"Error searching lore: {e}")
+                await update.message.reply_text("I encountered an error searching the lore. Please try again.")
+        else:
+            # No search term provided, show search menu
+            await self.search_menu(update, context)
+    
+    @error_handler(error_type="command", custom_message="I couldn't discover new lore. Please try again.")
+    async def discover_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /discover command to find random lore entries.
+        
+        Args:
+            update: The update containing the command
+            context: The context object for the bot
+        """
+        if not update or not update.message or not update.effective_user:
+            logger.error("Update, message, or effective_user is None in discover_command")
             return
             
         user_id = update.effective_user.id
         
-        # Log user action
         try:
-            async with ErrorContext(update, context, "database"):
-                self.db.execute_query(
-                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?",
-                    (user_id,)
+            # Get a random lore entry
+            category, name, content = self.lore_manager.get_random_lore()
+            
+            if not name:
+                await update.message.reply_text("No lore entries available for discovery.")
+                return
+            
+            # Record discovery in database
+            try:
+                # Check if already discovered
+                discovered = self.db.execute_query(
+                    "SELECT * FROM user_progress WHERE user_id = ? AND category = ? AND item_name = ?",
+                    (user_id, category, name)
+                )
+                
+                is_new_discovery = not discovered
+                
+                if is_new_discovery:
+                    # Record new discovery
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self.db.execute_query(
+                        "INSERT INTO user_progress (user_id, category, item_name, discovered, discovery_date) "
+                        "VALUES (?, ?, ?, TRUE, ?)",
+                        (user_id, category, name, current_time)
+                    )
+                
+                # Create message
+                message_text = f"📜 *{name}* 📜\n\n{content}\n\n"
+                message_text += f"*Category:* {category.capitalize()}"
+                
+                if is_new_discovery:
+                    message_text += "\n\n✨ *New Discovery!* ✨\nThis entry has been added to your collection."
+                
+                # Create keyboard
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🔄 Discover More", callback_data=create_callback_data("lore_discover")),
+                        InlineKeyboardButton("📚 View Collection", callback_data=create_callback_data("lore_collection"))
+                    ],
+                    [
+                        InlineKeyboardButton("« Back to Lore", callback_data=create_callback_data("lore_back"))
+                    ]
+                ])
+                
+                # Send message
+                await update.message.reply_text(
+                    message_text,
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            except Exception as db_error:
+                logger.error(f"Database error in discover_command: {db_error}")
+                
+                # Send message without recording discovery
+                message_text = f"📜 *{name}* 📜\n\n{content}\n\n"
+                message_text += f"*Category:* {category.capitalize()}"
+                
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🔄 Discover More", callback_data=create_callback_data("lore_discover")),
+                        InlineKeyboardButton("« Back to Lore", callback_data=create_callback_data("lore_back"))
+                    ]
+                ])
+                
+                await update.message.reply_text(
+                    message_text,
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
                 )
         except Exception as e:
-            logger.error(f"Database error in lore_command: {e}")
+            logger.error(f"Error discovering lore: {e}")
+            await update.message.reply_text("I encountered an error discovering lore. Please try again.")
+    
+    @error_handler(error_type="command", custom_message="I couldn't access your lore collection. Please try again.")
+    async def collection_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the /collection command to view discovered lore."""
+        if not update or not update.effective_user or not update.message:
+            logger.error("Update, effective_user, or message is None in collection_command")
+            return
+            
+        user_id = update.effective_user.id
         
-        # Get available categories
+        # Get discovered lore entries
         try:
-            categories = self.lore_manager.get_categories()
+            discovered = self.db.execute_query(
+                "SELECT category, item_name FROM user_progress "
+                "WHERE user_id = ? AND discovered = TRUE "
+                "ORDER BY category, item_name",
+                (user_id,)
+            )
         except Exception as e:
-            logger.error(f"Error getting categories: {e}")
-            categories = []
+            logger.error(f"Database error in collection_command: {e}")
+            discovered = []
+        
+        if not discovered:
+            await update.message.reply_text(
+                "You haven't discovered any lore entries yet.\n\n"
+                "Use /discover to find random lore entries, or /lore to browse categories."
+            )
+            return
+        
+        # Group by category
+        categories = {}
+        for row in discovered:
+            category, item_name = row
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(item_name)
         
         # Create menu items for categories
         menu_items = []
-        for category in categories:
-            callback_data = create_lore_category_callback(category)
-            menu_items.append((category.capitalize(), callback_data, "secondary"))
-        
-        # Add search button
-        search_callback = create_callback_data("lore_search")
-        menu_items.append(("🔍 Search", search_callback, "primary"))
+        for category, entries in categories.items():
+            callback_data = create_callback_data("collection_cat", name=category)
+            menu_items.append((f"{category.capitalize()} ({len(entries)})", callback_data, "secondary"))
         
         # Create keyboard with optimized layout
         keyboard = create_menu_keyboard(menu_items)
         
+        # Add back button
+        back_button = create_styled_button("« Back to Lore", create_callback_data("lore_back"), "back")
+        keyboard.inline_keyboard.append([back_button])
+        
         await update.message.reply_text(
-            "📚 *Explore the Lore of Fangen* 📚\n\n"
-            "What aspect of this mystical world would you like to discover?",
+            "📚 *Your Lore Collection* 📚\n\n"
+            f"You have discovered {len(discovered)} lore entries across {len(categories)} categories.\n\n"
+            "Select a category to view your discoveries:",
             reply_markup=keyboard,
             parse_mode='Markdown'
         )
     
-    @error_handler(error_type="general", custom_message="I couldn't perform that search. Please try again.")
-    async def search_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /search command to find specific lore entries."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in search_command")
-            return
-            
-        user_id = update.effective_user.id
-        query = ' '.join(context.args) if context.args else None
-        
-        if not query:
-            await update.message.reply_text(
-                "Please provide a search term after the command.\n"
-                "Example: `/search Diamond`",
-                parse_mode='Markdown'
-            )
-            return
-        
-        # Perform search
-        try:
-            results = self.lore_manager.search_lore(query)
-        except Exception as e:
-            logger.error(f"Error searching lore: {e}")
-            results = {}
-        
-        if not results:
-            await update.message.reply_text(
-                f"No lore entries found for '{query}'.\n\n"
-                f"Try a different search term or browse categories with /lore"
-            )
-            return
-        
-        await self._display_search_results(update, query, results)
-    
-    async def _display_search_results(
-        self, 
-        update: Update, 
-        query: str, 
-        results: Dict[str, List[str]], 
-        page: int = 0
-    ) -> None:
-        """Display search results with pagination."""
-        if not update:
-            logger.error("Update is None in _display_search_results")
-            return
-            
-        # Flatten results for pagination
-        flat_results = []
-        for category, entries in results.items():
-            for entry in entries:
-                flat_results.append({
-                    "id": lore_reference_manager.get_id(entry),
-                    "name": entry,
-                    "category": category
-                })
-        
-        # Create paginated keyboard
-        max_results = 10  # Default if MAX_SEARCH_RESULTS is not properly defined
-        if hasattr(MAX_SEARCH_RESULTS, '__int__'):
-            try:
-                max_results = int(MAX_SEARCH_RESULTS)
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid MAX_SEARCH_RESULTS value: {MAX_SEARCH_RESULTS}, using default")
-        
-        try:
-            keyboard, total_pages, current_page = create_paginated_keyboard(
-                flat_results,
-                page=page,
-                items_per_page=max_results,
-                callback_prefix="lore_entry",
-                show_pagination=True
-            )
-        except Exception as e:
-            logger.error(f"Error creating paginated keyboard: {e}")
-            # Create a simple keyboard as fallback
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("« Back to Lore", callback_data='{"action":"lore_back"}')]
-            ])
-            total_pages = 1
-            current_page = 0
-        
-        # Add back button if not already added
-        if not any("lore_back" in str(button.callback_data) for row in keyboard.inline_keyboard for button in row):
-            back_button = create_styled_button("« Back to Lore", create_callback_data("lore_back"), "back")
-            keyboard.inline_keyboard.append([back_button])
-        
-        # Send or edit message
-        message_text = (
-            f"🔍 *Search Results for '{query}'* 🔍\n\n"
-            f"Found {len(flat_results)} entries across {len(results)} categories."
-        )
-        
-        try:
-            if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    text=message_text,
-                    reply_markup=keyboard,
-                    parse_mode='Markdown'
-                )
-            elif update.message:
-                await update.message.reply_text(
-                    text=message_text,
-                    reply_markup=keyboard,
-                    parse_mode='Markdown'
-                )
-        except Exception as e:
-            logger.error(f"Error sending search results: {e}")
-            # Try to send a simple message as fallback
-            if update.effective_chat:
-                try:
-                    await update.effective_chat.send_message(
-                        text=f"Found {len(flat_results)} results for '{query}'. Please try viewing them again.",
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("Try Again", callback_data='{"action":"lore_search"}')
-                        ]])
-                    )
-                except Exception as inner_e:
-                    logger.error(f"Failed to send fallback message: {inner_e}")
-    
-    @error_handler(error_type="general", custom_message="I couldn't process that discovery. Please try again.")
-    async def discover_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /discover command to find random lore entries."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in discover_command")
-            return
-            
-        user_id = update.effective_user.id
-        
-        # Log user action
-        try:
-            async with ErrorContext(update, context, "database"):
-                self.db.execute_query(
-                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?",
-                    (user_id,)
-                )
-        except Exception as e:
-            logger.error(f"Database error in discover_command: {e}")
-        
-        # Get a random entry from the lore
-        try:
-            categories = self.lore_manager.get_categories()
-            if not categories:
-                await update.message.reply_text("No lore categories available.")
-                return
-            
-            # Select random category and entry
-            category = random.choice(categories)
-            entries = self.lore_manager.get_entries_by_category(category)
-            if not entries:
-                await update.message.reply_text(f"No entries found in the {category} category.")
-                return
-            
-            entry_name = random.choice(entries)
-            entry_content = self.lore_manager.get_entry_content(entry_name)
-            
-            if not entry_content:
-                await update.message.reply_text(f"Could not find content for {entry_name}.")
-                return
-        except Exception as e:
-            logger.error(f"Error discovering lore: {e}")
-            await update.message.reply_text("I encountered an issue while discovering lore. Please try again.")
-            return
-        
-        # Mark as discovered
-        try:
-            async with ErrorContext(update, context, "database"):
-                self.db.execute_query(
-                    "INSERT OR IGNORE INTO user_progress (user_id, category, item_name, discovered, discovery_date) "
-                    "VALUES (?, ?, ?, TRUE, CURRENT_TIMESTAMP)",
-                    (user_id, category, entry_name)
-                )
-        except Exception as e:
-            logger.error(f"Database error marking discovery: {e}")
-        
-        # Format content
-        try:
-            if isinstance(entry_content, dict):
-                formatted_content = ""
-                for key, value in entry_content.items():
-                    if key not in ["name", "title", "rarity"] and value:
-                        formatted_content += f"*{key.capitalize()}*: {value}\n\n"
-            else:
-                formatted_content = entry_content
-        except Exception as e:
-            logger.error(f"Error formatting content: {e}")
-            formatted_content = "Error formatting content. Please try again."
-        
-        # Create keyboard
-        keyboard = [
-            [create_styled_button(
-                "View Details", 
-                create_lore_entry_callback(entry_name), 
-                "primary"
-            )],
-            [create_styled_button(
-                "Discover More", 
-                create_callback_data("discover_more"), 
-                "secondary"
-            )],
-            [create_styled_button(
-                "« Back to Lore", 
-                create_callback_data("lore_back"), 
-                "back"
-            )]
-        ]
-        
-        # Send message
-        message = (
-            f"✨ *You discovered: {entry_name}* ✨\n\n"
-            f"*Category*: {category.capitalize()}\n\n"
-            f"{formatted_content}"
-        )
-        
-        await update.message.reply_text(
-            message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-    
     @error_handler(error_type="callback", custom_message="I couldn't process that button press. Please try again.")
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle callback queries for lore-related features."""
+    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: Dict[str, Any]) -> None:
+        """Handle callback queries for lore-related features.
+        
+        Args:
+            update: The update containing the callback query
+            context: The context object for the bot
+            callback_data: The parsed callback data
+        """
         if not update or not update.callback_query or not update.effective_user:
             logger.error("Update, callback_query, or effective_user is None in handle_callback")
             return
             
         query = update.callback_query
         
-        # Parse callback data
-        try:
-            callback_data = parse_callback_data(query.data)
-            action = callback_data.get("action", "")
-        except Exception as e:
-            logger.error(f"Failed to parse callback data: {e}")
-            await query.answer("Invalid callback data")
-            return
+        # Get the action
+        action = callback_data.get("action", "")
         
         # Answer callback query with appropriate message
-        feedback_messages = {
-            "lore_cat": "Loading category...",
-            "lore_entry": "Loading entry...",
-            "lore_search": "Opening search...",
-            "lore_back": "Going back...",
-            "search_cat": "Loading category results...",
-            "search_more": "Loading more results...",
-            "discover_more": "Discovering more...",
-            "collection_cat": "Loading collection category...",
-            "page": "Changing page..."
-        }
+        if action == "lore_back":
+            await query.answer("Returning to lore menu")
+            # Create a fake update to reuse the lore_command
+            await self.lore_command(update, context)
+        elif action == "lore_category":
+            await query.answer("Loading category")
+            await self._handle_category_callback(update, context, callback_data)
+        elif action == "lore_entry":
+            await query.answer("Loading entry")
+            await self._handle_entry_callback(update, context, callback_data)
+        elif action == "lore_discover":
+            await query.answer("Finding random lore")
+            # Create a fake update to reuse the discover_command
+            await self.discover_command(update, context)
+        elif action == "lore_collection":
+            await query.answer("Loading your collection")
+            # Create a fake update to reuse the collection_command
+            await self.collection_command(update, context)
+        elif action == "collection_cat":
+            await query.answer("Loading category")
+            await self._handle_collection_category_callback(update, context, callback_data)
+        else:
+            await query.answer("Unknown action")
+            logger.warning(f"Unknown lore callback action: {action}")
+    
+    @error_handler(error_type="callback", custom_message="I couldn't open the search menu. Please try again.")
+    async def search_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Display the search menu for lore entries.
         
-        try:
-            await query.answer(feedback_messages.get(action, "Processing..."))
-        except Exception as e:
-            logger.warning(f"Failed to answer callback query: {e}")
+        Args:
+            update: The update containing the command or callback query
+            context: The context object for the bot
+        """
+        # Determine if this is from a command or callback
+        if update.callback_query:
+            message_func = update.callback_query.edit_message_text
+            await update.callback_query.answer("Opening search menu")
+        elif update.message:
+            message_func = update.message.reply_text
+        else:
+            logger.error("Neither callback_query nor message in search_menu")
+            return
         
-        # Get user ID
-        user_id = update.effective_user.id
+        # Create search instructions
+        message_text = (
+            "🔍 *Search the Lore of Fangen* 🔍\n\n"
+            "To search for lore entries, use the /search command followed by your search terms.\n\n"
+            "For example:\n"
+            "• /search ancient magic\n"
+            "• /search dragons\n"
+            "• /search elemental powers\n\n"
+            "You can also browse categories or discover random lore entries."
+        )
         
-        # Store the current action in user_data for retry functionality
-        if context and context.user_data is not None:
-            context.user_data["last_action"] = query.data
+        # Create keyboard
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📚 Browse Categories", callback_data=create_callback_data("lore_back")),
+                InlineKeyboardButton("🎲 Random Discovery", callback_data=create_callback_data("lore_discover"))
+            ],
+            [
+                InlineKeyboardButton("📋 View Collection", callback_data=create_callback_data("lore_collection")),
+                InlineKeyboardButton("🏠 Main Menu", callback_data=create_callback_data("main_menu"))
+            ]
+        ])
         
-        # Handle different callback types
-        try:
-            if action == "lore_cat":
-                await self._handle_category_callback(update, context, callback_data)
-            elif action == "lore_entry":
-                await self._handle_entry_callback(update, context, callback_data)
-            elif action == "lore_search":
-                await self._handle_search_callback(update, context)
-            elif action == "lore_back":
-                await self._handle_back_callback(update, context)
-            elif action == "search_cat":
-                await self._handle_search_category_callback(update, context, callback_data)
-            elif action == "search_more":
-                await self._handle_search_more_callback(update, context, callback_data)
-            elif action == "discover_more":
-                await self._handle_discover_more_callback(update, context)
-            elif action == "collection_cat":
-                await self._handle_collection_category_callback(update, context, callback_data)
-            elif action == "page":
-                await self._handle_page_callback(update, context, callback_data)
-            else:
-                logger.warning(f"Unknown lore callback action: {action}")
-                await query.edit_message_text(
-                    "I'm not sure how to handle that request.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
-                    ]])
-                )
-        except Exception as e:
-            logger.error(f"Error handling callback {action}: {e}")
-            # Try to provide a graceful fallback
+        # Send or edit message
+        await message_func(
+            message_text,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+        # If this is from a message, update user state
+        if update.message and update.effective_user and self.db:
             try:
-                await query.edit_message_text(
-                    "Sorry, I encountered an error processing your request.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔄 Try Again", callback_data='{"action":"retry"}'),
-                        InlineKeyboardButton("🏠 Main Menu", callback_data='{"action":"main_menu"}')
-                    ]])
-                )
-            except Exception as inner_e:
-                logger.error(f"Failed to send error message: {inner_e}")
-
-    # Helper methods for handling specific callback types
-    # These methods would be implemented here...
+                user_id = update.effective_user.id
+                self.db.update_user_state(user_id, "search_active", True)
+            except Exception as e:
+                logger.error(f"Error updating user state in search_menu: {e}")
+    
+    # Helper methods for handling specific callbacks
     # For brevity, I'm not including all of them in this example
-
     async def _handle_category_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: Dict[str, Any]) -> None:
         """Handle callback for selecting a lore category."""
         if not update or not update.callback_query:
@@ -457,59 +462,4 @@ class LoreCommandHandlers:
                     InlineKeyboardButton("« Back to Lore", callback_data='{"action":"lore_back"}')
                 ]])
             )
-
-    async def collection_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the /collection command to view discovered lore."""
-        if not update or not update.effective_user or not update.message:
-            logger.error("Update, effective_user, or message is None in collection_command")
-            return
             
-        user_id = update.effective_user.id
-        
-        # Get discovered lore entries
-        try:
-            discovered = self.db.execute_query(
-                "SELECT category, item_name FROM user_progress "
-                "WHERE user_id = ? AND discovered = TRUE "
-                "ORDER BY category, item_name",
-                (user_id,)
-            )
-        except Exception as e:
-            logger.error(f"Database error in collection_command: {e}")
-            discovered = []
-        
-        if not discovered:
-            await update.message.reply_text(
-                "You haven't discovered any lore entries yet.\n\n"
-                "Use /discover to find random lore entries, or /lore to browse categories."
-            )
-            return
-        
-        # Group by category
-        categories = {}
-        for row in discovered:
-            category, item_name = row
-            if category not in categories:
-                categories[category] = []
-            categories[category].append(item_name)
-        
-        # Create menu items for categories
-        menu_items = []
-        for category, entries in categories.items():
-            callback_data = create_callback_data("collection_cat", name=category)
-            menu_items.append((f"{category.capitalize()} ({len(entries)})", callback_data, "secondary"))
-        
-        # Create keyboard with optimized layout
-        keyboard = create_menu_keyboard(menu_items)
-        
-        # Add back button
-        back_button = create_styled_button("« Back to Lore", create_callback_data("lore_back"), "back")
-        keyboard.inline_keyboard.append([back_button])
-        
-        await update.message.reply_text(
-            "📚 *Your Lore Collection* 📚\n\n"
-            f"You have discovered {len(discovered)} lore entries across {len(categories)} categories.\n\n"
-            "Select a category to view your discoveries:",
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
