@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -52,67 +51,121 @@ class QuestManager:
         
         return all_quests
     
+    def get_available_recipes(self, user_id: int) -> List[Dict]:
+        """Get available crafting recipes for a user.
+        
+        Args:
+            user_id: The user ID to check recipes for
+            
+        Returns:
+            List of available recipe dictionaries with name, requirements, and rarity
+        """
+        # Get all recipes from database
+        recipes = self.db.execute_query(
+            "SELECT * FROM crafting_recipes"
+        )
+        
+        if not recipes:
+            return []
+            
+        # Get user's quest progress to check quest requirements
+        user_progress = self.db.execute_query(
+            "SELECT * FROM user_progress WHERE user_id = ? AND category = 'quests'",
+            (user_id,)
+        )
+        
+        completed_quests = [
+            item['item_name'] for item in user_progress if item['discovered']
+        ]
+        
+        # Get user's inventory to show available materials
+        user_inventory = self.db.execute_query(
+            "SELECT item_name, quantity FROM user_inventory WHERE user_id = ?",
+            (user_id,)
+        )
+        
+        inventory_dict = {item["item_name"]: item["quantity"] for item in user_inventory}
+        
+        # Filter recipes based on quest requirements
+        available_recipes = []
+        for recipe in recipes:
+            quest_requirements = json.loads(recipe["quest_requirements"])
+            
+            # Check if all required quests are completed
+            requirements_met = True
+            for quest_name in quest_requirements:
+                if quest_name not in completed_quests:
+                    requirements_met = False
+                    break
+                    
+            if requirements_met:
+                # Add recipe with material availability info
+                material_requirements = json.loads(recipe["requirements"])
+                materials_status = {}
+                
+                for item_name, required_qty in material_requirements.items():
+                    available_qty = inventory_dict.get(item_name, 0)
+                    materials_status[item_name] = {
+                        "required": required_qty,
+                        "available": available_qty,
+                        "sufficient": available_qty >= required_qty
+                    }
+                
+                available_recipes.append({
+                    "name": recipe["result_item"],
+                    "rarity": recipe["result_rarity"],
+                    "requirements": material_requirements,
+                    "materials_status": materials_status,
+                    "can_craft": all(status["sufficient"] for status in materials_status.values())
+                })
+                
+        return available_recipes
+    
     def start_quest(self, user_id: int, quest_name: str) -> Tuple[bool, str, Dict]:
         """Start a quest for a user.
         
         Initializes a new quest for the user if they are not already on one,
-        sets up the initial quest state, and returns the first scene.
+        and returns the first scene of the quest.
         
         Args:
-            user_id: The user ID starting the quest
+            user_id: The user ID to start the quest for
             quest_name: The name of the quest to start
             
         Returns:
             Tuple containing (success, message, scene_data)
         """
+        # Check if user is already on a quest
+        if user_id in self.active_quests:
+            return False, "You are already on a quest. Use /active to see your current quest or /abandon to quit it.", {}
+        
+        # Check if quest exists
         quest_info = self.lore_manager.get_quest_info(quest_name)
         if not quest_info:
             return False, f"Quest '{quest_name}' not found.", {}
         
-        # Check if user is already on a quest
-        if user_id in self.active_quests:
-            return False, "You are already on a quest. Use /abandonquest to abandon your current quest.", {}
-        
-        # Set up initial quest state
-        quest_state = {
+        # Initialize quest state
+        self.active_quests[user_id] = {
             "quest_name": quest_name,
             "current_scene": 1,
-            "choices_made": [],
-            "inventory_updates": [],
-            "dialogue_history": []
+            "inventory": {},
+            "state": {}
         }
         
-        self.active_quests[user_id] = quest_state
-        
-        # Log quest start
+        # Record in database
+        current_time = self.db.execute_query("SELECT datetime('now') as time")[0]["time"]
         self.db.execute_query(
-            "INSERT INTO quest_logs (user_id, quest_name, status, started_at) VALUES (?, ?, 'in_progress', CURRENT_TIMESTAMP)",
-            (user_id, quest_name)
+            "INSERT OR REPLACE INTO user_quests (user_id, quest_name, status, current_scene, started_date) VALUES (?, ?, ?, ?, ?)",
+            (user_id, quest_name, "active", 1, current_time)
         )
         
         # Get first scene
-        scenes = quest_info.get("scenes", [])
-        if not scenes:
-            return False, f"Quest '{quest_name}' has no scenes defined.", {}
-        
-        first_scene = next((s for s in scenes if s["number"] == "1"), None)
-        if not first_scene:
-            return False, f"First scene of quest '{quest_name}' not found.", {}
-        
-        # Format scene for display
-        scene_data = self._format_scene_for_display(first_scene)
-        
-        return True, f"You have started the quest: {quest_name}", scene_data
+        return self._get_scene_data(user_id)
     
-    def make_choice(self, user_id: int, choice_id: str) -> Tuple[bool, str, Dict]:
-        """Process a user's choice in a quest.
-        
-        Handles the user's decision in the current quest scene, updates quest state,
-        processes inventory changes, and determines the next scene.
+    def _get_scene_data(self, user_id: int) -> Tuple[bool, str, Dict]:
+        """Get the current scene data for a user's active quest.
         
         Args:
-            user_id: The user ID making the choice
-            choice_id: The ID of the choice selected
+            user_id: The user ID to get scene data for
             
         Returns:
             Tuple containing (success, message, scene_data)
@@ -122,134 +175,263 @@ class QuestManager:
         
         quest_state = self.active_quests[user_id]
         quest_name = quest_state["quest_name"]
-        quest_info = self.lore_manager.get_quest_info(quest_name)
+        current_scene = quest_state["current_scene"]
         
+        # Get quest info
+        quest_info = self.lore_manager.get_quest_info(quest_name)
         if not quest_info:
             return False, f"Quest '{quest_name}' not found.", {}
         
-        # Find current scene
-        current_scene_num = quest_state["current_scene"]
-        scenes = quest_info.get("scenes", [])
-        current_scene = next((s for s in scenes if s["number"] == str(current_scene_num)), None)
+        # Get scene data
+        scenes = quest_info.get("scenes", {})
+        scene_key = f"scene_{current_scene}"
         
-        if not current_scene:
-            return False, f"Scene {current_scene_num} of quest '{quest_name}' not found.", {}
+        if scene_key not in scenes:
+            return False, f"Scene {current_scene} not found for quest '{quest_name}'.", {}
         
-        # Find choice
-        choice = next((c for c in current_scene["choices"] if c["id"] == choice_id), None)
-        if not choice:
+        scene_data = scenes[scene_key]
+        
+        # Process any dynamic content in the scene
+        scene_data = self._process_dynamic_content(scene_data, quest_state)
+        
+        return True, "", scene_data
+    
+    def _process_dynamic_content(self, scene_data: Dict, quest_state: Dict) -> Dict:
+        """Process any dynamic content in the scene data.
+        
+        Handles variable substitution, conditional content, etc.
+        
+        Args:
+            scene_data: The scene data to process
+            quest_state: The current quest state
+            
+        Returns:
+            Processed scene data
+        """
+        # Make a copy to avoid modifying the original
+        processed_data = dict(scene_data)
+        
+        # Process narrative text
+        if "narrative" in processed_data:
+            narrative = processed_data["narrative"]
+            
+            # Replace variables
+            for key, value in quest_state["state"].items():
+                placeholder = f"{{{key}}}"
+                if placeholder in narrative:
+                    narrative = narrative.replace(placeholder, str(value))
+            
+            processed_data["narrative"] = narrative
+        
+        # Process choices
+        if "choices" in processed_data:
+            processed_choices = []
+            
+            for choice in processed_data["choices"]:
+                # Check if choice has conditions
+                if "conditions" in choice:
+                    conditions_met = True
+                    
+                    for condition_key, condition_value in choice["conditions"].items():
+                        if quest_state["state"].get(condition_key) != condition_value:
+                            conditions_met = False
+                            break
+                    
+                    if not conditions_met:
+                        continue
+                
+                # Process choice text
+                choice_text = choice["text"]
+                for key, value in quest_state["state"].items():
+                    placeholder = f"{{{key}}}"
+                    if placeholder in choice_text:
+                        choice_text = choice_text.replace(placeholder, str(value))
+                
+                processed_choice = dict(choice)
+                processed_choice["text"] = choice_text
+                processed_choices.append(processed_choice)
+            
+            processed_data["choices"] = processed_choices
+        
+        return processed_data
+    
+    def make_choice(self, user_id: int, choice_id: str) -> Tuple[bool, str, Dict]:
+        """Make a choice in the current quest scene.
+        
+        Args:
+            user_id: The user ID making the choice
+            choice_id: The ID of the choice being made
+            
+        Returns:
+            Tuple containing (success, message, next_scene_data)
+        """
+        if user_id not in self.active_quests:
+            return False, "You are not currently on a quest.", {}
+        
+        quest_state = self.active_quests[user_id]
+        quest_name = quest_state["quest_name"]
+        current_scene = quest_state["current_scene"]
+        
+        # Get quest info
+        quest_info = self.lore_manager.get_quest_info(quest_name)
+        if not quest_info:
+            return False, f"Quest '{quest_name}' not found.", {}
+        
+        # Get scene data
+        scenes = quest_info.get("scenes", {})
+        scene_key = f"scene_{current_scene}"
+        
+        if scene_key not in scenes:
+            return False, f"Scene {current_scene} not found for quest '{quest_name}'.", {}
+        
+        scene_data = scenes[scene_key]
+        
+        # Find the chosen choice
+        chosen_choice = None
+        for choice in scene_data.get("choices", []):
+            if choice.get("id") == choice_id:
+                chosen_choice = choice
+                break
+        
+        if not chosen_choice:
             return False, f"Choice '{choice_id}' not found in current scene.", {}
         
-        # Process choice
-        quest_state["choices_made"].append({
-            "scene": current_scene_num,
-            "choice_id": choice_id,
-            "description": choice["description"]
-        })
+        # Record the decision
+        self.db.execute_query(
+            "INSERT OR REPLACE INTO decision_logs (user_id, quest_name, scene_id, choice_id, decision_date) VALUES (?, ?, ?, ?, datetime('now'))",
+            (user_id, quest_name, scene_key, choice_id)
+        )
         
-        # Add to dialogue history
-        if choice["player_dialogue"]:
-            quest_state["dialogue_history"].append({
-                "speaker": "player",
-                "text": choice["player_dialogue"]
-            })
+        # Process choice outcomes
+        if "outcomes" in chosen_choice:
+            outcomes = chosen_choice["outcomes"]
+            
+            # Update state variables
+            if "state_changes" in outcomes:
+                for key, value in outcomes["state_changes"].items():
+                    quest_state["state"][key] = value
+            
+            # Add items to inventory
+            if "items_gained" in outcomes:
+                for item_name, quantity in outcomes["items_gained"].items():
+                    if item_name in quest_state["inventory"]:
+                        quest_state["inventory"][item_name] += quantity
+                    else:
+                        quest_state["inventory"][item_name] = quantity
+            
+            # Remove items from inventory
+            if "items_lost" in outcomes:
+                for item_name, quantity in outcomes["items_lost"].items():
+                    if item_name in quest_state["inventory"]:
+                        quest_state["inventory"][item_name] -= quantity
+                        if quest_state["inventory"][item_name] <= 0:
+                            del quest_state["inventory"][item_name]
         
-        # Process inventory updates
-        for update in choice["inventory_updates"]:
-            if "Add" in update:
-                item_name = update.replace("Add ", "").split(" (")[0]
-                rarity = "Normal"
-                if "(" in update and ")" in update:
-                    rarity_match = update.split("(")[1].split(")")[0]
-                    if rarity_match in ["Normal", "Rare", "Legendary"]:
-                        rarity = rarity_match
+        # Move to next scene
+        next_scene = chosen_choice.get("next_scene")
+        if next_scene:
+            quest_state["current_scene"] = next_scene
+            
+            # Update database
+            self.db.execute_query(
+                "UPDATE user_quests SET current_scene = ? WHERE user_id = ? AND quest_name = ?",
+                (next_scene, user_id, quest_name)
+            )
+            
+            # Check if this is the final scene
+            if next_scene == "complete":
+                return self._complete_quest(user_id)
+            
+            # Get next scene data
+            return self._get_scene_data(user_id)
+        
+        return False, "No next scene specified for this choice.", {}
+    
+    def _complete_quest(self, user_id: int) -> Tuple[bool, str, Dict]:
+        """Complete a quest for a user.
+        
+        Args:
+            user_id: The user ID completing the quest
+            
+        Returns:
+            Tuple containing (success, message, completion_data)
+        """
+        if user_id not in self.active_quests:
+            return False, "You are not currently on a quest.", {}
+        
+        quest_state = self.active_quests[user_id]
+        quest_name = quest_state["quest_name"]
+        
+        # Get quest info
+        quest_info = self.lore_manager.get_quest_info(quest_name)
+        if not quest_info:
+            return False, f"Quest '{quest_name}' not found.", {}
+        
+        # Update database
+        current_time = self.db.execute_query("SELECT datetime('now') as time")[0]["time"]
+        self.db.execute_query(
+            "UPDATE user_quests SET status = ?, completed_date = ? WHERE user_id = ? AND quest_name = ?",
+            ("completed", current_time, user_id, quest_name)
+        )
+        
+        # Record discovery
+        self.db.record_discovery(user_id, "quests", quest_name)
+        
+        # Process rewards
+        rewards = quest_info.get("rewards", {})
+        reward_text = "Quest completed! You've earned:\n"
+        
+        # XP rewards
+        if "xp" in rewards:
+            xp = rewards["xp"]
+            reward_text += f"• {xp} XP\n"
+            # TODO: Implement XP system
+        
+        # Item rewards
+        if "items" in rewards:
+            for item_name, quantity in rewards["items"].items():
+                reward_text += f"• {quantity}x {item_name}\n"
                 
-                # Add item to user inventory
-                self.db.execute_query(
-                    "INSERT OR IGNORE INTO user_inventory (user_id, item_name, rarity, quantity, acquired_at) "
-                    "VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
-                    (user_id, item_name, rarity)
-                )
+                # Add to user inventory
+                item_info = self.lore_manager.get_item(item_name)
+                rarity = "common"
+                if item_info and isinstance(item_info, dict):
+                    rarity = item_info.get("rarity", "common")
                 
-                # Increment if already exists
-                self.db.execute_query(
-                    "UPDATE user_inventory SET quantity = quantity + 1 WHERE user_id = ? AND item_name = ?",
+                # Check if item already exists in inventory
+                existing_item = self.db.execute_query(
+                    "SELECT quantity FROM user_inventory WHERE user_id = ? AND item_name = ?",
                     (user_id, item_name)
                 )
                 
-                quest_state["inventory_updates"].append(f"Added {item_name} ({rarity})")
-            
-            elif "Consume" in update or "Remove" in update:
-                items = update.replace("Consume ", "").replace("Remove ", "").split(" and ")
-                for item in items:
-                    item_name = item.strip()
-                    
-                    # Remove item from user inventory
+                if existing_item:
                     self.db.execute_query(
-                        "UPDATE user_inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_name = ? AND quantity > 0",
-                        (user_id, item_name)
+                        "UPDATE user_inventory SET quantity = quantity + ? WHERE user_id = ? AND item_name = ?",
+                        (quantity, user_id, item_name)
                     )
-                    
-                    quest_state["inventory_updates"].append(f"Consumed {item_name}")
+                else:
+                    self.db.execute_query(
+                        "INSERT INTO user_inventory (user_id, item_name, rarity, quantity) VALUES (?, ?, ?, ?)",
+                        (user_id, item_name, rarity, quantity)
+                    )
         
-        # Determine next scene
-        next_scene_num = current_scene_num + 1
-        next_scene = next((s for s in scenes if s["number"] == str(next_scene_num)), None)
+        # Lore discoveries
+        if "discoveries" in rewards:
+            for category, items in rewards["discoveries"].items():
+                for item_name in items:
+                    reward_text += f"• Discovered: {item_name} ({category})\n"
+                    self.db.record_discovery(user_id, category, item_name)
         
-        if next_scene:
-            # Move to next scene
-            quest_state["current_scene"] = next_scene_num
-            scene_data = self._format_scene_for_display(next_scene)
-            return True, f"You chose: {choice['description']}", scene_data
-        else:
-            # End of quest
-            self._complete_quest(user_id, quest_name)
-            return True, f"Quest '{quest_name}' completed!", {
-                "type": "quest_end",
-                "title": f"Quest Completed: {quest_name}",
-                "text": "Congratulations! You have completed the quest.",
-                "choices_made": quest_state["choices_made"],
-                "inventory_updates": quest_state["inventory_updates"]
-            }
-    
-    def _complete_quest(self, user_id: int, quest_name: str) -> None:
-        """Mark a quest as completed for a user."""
-        # Update quest log
-        self.db.execute_query(
-            "UPDATE quest_logs SET status = 'completed', completed_at = CURRENT_TIMESTAMP "
-            "WHERE user_id = ? AND quest_name = ? AND status = 'in_progress'",
-            (user_id, quest_name)
-        )
-        
-        # Update user progress
-        self.db.execute_query(
-            "INSERT OR IGNORE INTO user_progress (user_id, category, item_name, discovered, discovery_date) "
-            "VALUES (?, 'quests', ?, TRUE, CURRENT_TIMESTAMP)",
-            (user_id, quest_name)
-        )
-        
-        # Remove from active quests
-        if user_id in self.active_quests:
-            del self.active_quests[user_id]
-    
-    def abandon_quest(self, user_id: int) -> Tuple[bool, str]:
-        """Abandon a user's current quest."""
-        if user_id not in self.active_quests:
-            return False, "You are not currently on a quest."
-        
-        quest_name = self.active_quests[user_id]["quest_name"]
-        
-        # Update quest log
-        self.db.execute_query(
-            "UPDATE quest_logs SET status = 'abandoned', completed_at = CURRENT_TIMESTAMP "
-            "WHERE user_id = ? AND quest_name = ? AND status = 'in_progress'",
-            (user_id, quest_name)
-        )
-        
-        # Remove from active quests
+        # Clean up active quest
         del self.active_quests[user_id]
         
-        return True, f"You have abandoned the quest: {quest_name}"
+        completion_data = {
+            "quest_name": quest_name,
+            "rewards": rewards,
+            "message": reward_text
+        }
+        
+        return True, reward_text, completion_data
     
     def get_current_quest(self, user_id: int) -> Tuple[bool, str, Dict]:
         """Get the current quest state for a user.
@@ -273,108 +455,201 @@ class QuestManager:
         if not quest_info:
             return False, f"Quest '{quest_name}' not found.", {}
         
-        # Find current scene
-        current_scene_num = quest_state["current_scene"]
-        scenes = quest_info.get("scenes", [])
-        current_scene = next((s for s in scenes if s["number"] == str(current_scene_num)), None)
-        
-        if not current_scene:
-            return False, f"Scene {current_scene_num} of quest '{quest_name}' not found.", {}
-        
-        # Format scene for display
-        scene_data = self._format_scene_for_display(current_scene)
-        
-        return True, f"Current quest: {quest_name} (Scene {current_scene_num})", scene_data
+        # Get current scene data
+        return self._get_scene_data(user_id)
     
-    def _format_scene_for_display(self, scene: Dict) -> Dict:
-        """Format a scene for display to the user.
-        
-        Converts the internal scene representation into a format suitable
-        for display to the user in the Telegram interface.
+    def abandon_quest(self, user_id: int) -> Tuple[bool, str]:
+        """Abandon the current quest for a user.
         
         Args:
-            scene: Dictionary containing scene data
+            user_id: The user ID abandoning the quest
             
         Returns:
-            Dictionary with formatted scene content for display
+            Tuple containing (success, message)
         """
-        # Build narrative text
-        narrative = f"**Scene {scene['number']}: {scene['title']}**\n\n"
+        if user_id not in self.active_quests:
+            return False, "You are not currently on a quest."
         
-        if scene['setting']:
-            narrative += f"*{scene['setting']}\n\n"
+        quest_state = self.active_quests[user_id]
+        quest_name = quest_state["quest_name"]
         
-        # Add NPC dialogues
-        for npc, dialogue in scene.get('npc_dialogues', {}).items():
-            narrative += f"**{npc}**: \"{dialogue}\"\n\n"
-        
-        # Format choices
-        choices = []
-        for choice in scene.get('choices', []):
-            choices.append({
-                "id": choice['id'],
-                "text": choice['description']
-            })
-        
-        return {
-            "type": "scene",
-            "narrative": narrative,
-            "choices": choices
-        }
-    
-    def get_character_response(self, user_id: int, character_name: str, message: str) -> str:
-        """Generate a response from a character based on the user's message."""
-        character_info = self.lore_manager.get_character_info(character_name)
-        if not character_info:
-            return f"I am {character_name}, but I don't seem to have much to say right now."
-        
-        # Log interaction in database
+        # Update database
         self.db.execute_query(
-            "INSERT INTO interactions (user_id, character, message, timestamp) "
-            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-            (user_id, character_name, message)
+            "UPDATE user_quests SET status = ? WHERE user_id = ? AND quest_name = ?",
+            ("abandoned", user_id, quest_name)
         )
         
-        # Extract character traits and info
-        personality = character_info.get("personality", "")
-        backstory = character_info.get("backstory", "")
+        # Clean up active quest
+        del self.active_quests[user_id]
         
-        # Look for keywords in the user's message that might match character lore
-        keywords = [word.lower() for word in message.split() if len(word) > 3]
+        return True, f"You have abandoned the quest '{quest_name}'."
+    
+    def interact_with_character(self, user_id: int, character_name: str, message: str) -> Tuple[bool, str, Dict]:
+        """Interact with a character by sending them a message.
         
-        # Find relevant information based on keywords
-        relevant_info = []
+        Args:
+            user_id: The user ID interacting with the character
+            character_name: The name of the character to interact with
+            message: The message to send to the character
+            
+        Returns:
+            Tuple containing (success, response, character_info)
+        """
+        # Get character info
+        character_info = self.lore_manager.get_character(character_name)
+        if not character_info:
+            return False, f"Character '{character_name}' not found.", {}
         
-        # Check in backstory
-        for keyword in keywords:
-            if keyword in backstory.lower():
-                sentences = backstory.split('.')
-                for sentence in sentences:
-                    if keyword in sentence.lower():
-                        relevant_info.append(sentence.strip())
+        # Generate response based on character traits and message content
+        response = self._generate_character_response(character_name, character_info, message)
         
-        # Check in personality if needed
-        if not relevant_info:
-            for keyword in keywords:
-                if keyword in personality.lower():
-                    sentences = personality.split('.')
-                    for sentence in sentences:
-                        if keyword in sentence.lower():
-                            relevant_info.append(sentence.strip())
+        # Record interaction
+        current_time = self.db.execute_query("SELECT datetime('now') as time")[0]["time"]
         
-        # Generate response based on character info
-        if relevant_info:
-            # Create character-specific response incorporating relevant info
-            intro_phrases = self._get_character_intros(character_name, character_info)
-            return f"{random.choice(intro_phrases)} {random.choice(relevant_info)}."
+        # Check if relationship exists
+        existing = self.db.execute_query(
+            "SELECT 1 FROM user_relationships WHERE user_id = ? AND character_name = ?",
+            (user_id, character_name)
+        )
+        
+        if existing:
+            self.db.execute_query(
+                "UPDATE user_relationships SET last_interaction = ? WHERE user_id = ? AND character_name = ?",
+                (current_time, user_id, character_name)
+            )
         else:
-            # Generate generic response based on character traits
-            return self._generate_generic_response(character_name, character_info, message)
+            self.db.execute_query(
+                "INSERT INTO user_relationships (user_id, character_name, affinity, first_met, last_interaction) VALUES (?, ?, ?, ?, ?)",
+                (user_id, character_name, 0, current_time, current_time)
+            )
+        
+        # Return response and character info
+        return True, response, character_info
+    
+    def _generate_character_response(self, character_name: str, character_info: Dict, message: str) -> str:
+        """Generate a character response based on their traits and the message.
+        
+        Args:
+            character_name: The name of the character
+            character_info: The character's information
+            message: The message sent to the character
+            
+        Returns:
+            The character's response
+        """
+        # Check for specific keywords in the message
+        lower_message = message.lower()
+        
+        # Check for greetings
+        if any(greeting in lower_message for greeting in ["hello", "hi", "hey", "greetings"]):
+            return self._generate_greeting(character_name, character_info)
+        
+        # Check for questions about the character
+        if "who are you" in lower_message or "about you" in lower_message:
+            return self._generate_self_introduction(character_name, character_info)
+        
+        # Check for questions about the world
+        if any(keyword in lower_message for keyword in ["world", "fangen", "history", "lore"]):
+            return self._generate_lore_response(character_name, character_info, "world")
+        
+        # Check for questions about items
+        if any(keyword in lower_message for keyword in ["item", "weapon", "artifact", "craft"]):
+            return self._generate_lore_response(character_name, character_info, "items")
+        
+        # Check for questions about quests
+        if any(keyword in lower_message for keyword in ["quest", "mission", "task", "adventure"]):
+            return self._generate_lore_response(character_name, character_info, "quests")
+        
+        # Generate a generic response if no specific patterns match
+        return self._generate_generic_response(character_name, character_info, message)
+    
+    def _generate_greeting(self, character_name: str, character_info: Dict) -> str:
+        """Generate a greeting response from a character."""
+        personality = character_info.get("personality", "").lower()
+        
+        # Character-specific greetings
+        if character_name == "Hand of Diamond":
+            return "The light of Diamond shines upon you. What guidance do you seek from the elements?"
+        
+        elif character_name == "Zero":
+            return "The threads of fate intertwine in curious ways. I've been expecting you, though perhaps not in this timeline."
+        
+        elif character_name == "Wagami":
+            return "*looks up from a complex device* Oh! Hello there! Caught me in the middle of a fascinating experiment. How can I help you today?"
+        
+        elif character_name == "Anko":
+            return "*sharpens kunai* Well, well... look who's here. Got something interesting for me, or just wasting my time?"
+        
+        # Generic greetings based on personality types
+        elif "arrogant" in personality or "cunning" in personality:
+            return "Ah, you've sought me out. A wise decision, though I wonder if you truly comprehend what you're asking for."
+        
+        elif "stoic" in personality or "cold" in personality:
+            return "You have my attention, for now. State your purpose clearly."
+        
+        elif "playful" in personality or "eccentric" in personality:
+            return "*eyes light up* Oh hello there! What a delightful surprise! What brings you to my little corner of Fangen today?"
+        
+        elif "fierce" in personality or "protective" in personality:
+            return "*assesses you carefully* Stand your ground and speak plainly. What do you seek from me?"
+        
+        # Default greeting
+        return f"Greetings, traveler. I am {character_name}. What brings you to me today?"
+    
+    def _generate_self_introduction(self, character_name: str, character_info: Dict) -> str:
+        """Generate a self-introduction from a character."""
+        backstory = character_info.get("backstory", "")
+        role = character_info.get("role", "")
+        personality = character_info.get("personality", "")
+        
+        # Truncate long text
+        if len(backstory) > 150:
+            backstory = backstory[:147] + "..."
+        
+        # Character-specific introductions
+        if character_name == "Hand of Diamond":
+            return "I am the Hand of Diamond, emissary of the elemental forces that shape our world. I guide those who would maintain balance and protect the realm from those who would upset it."
+        
+        elif character_name == "Zero":
+            return "I am called Zero, though names are but temporary labels in the grand tapestry of existence. I see the threads of possibility, the paths not taken, and occasionally, I intervene when catastrophe looms."
+        
+        elif character_name == "Wagami":
+            return "*adjusts glasses excitedly* I'm Wagami! Chief researcher of anomalous phenomena and quantum irregularities! Some call my methods unorthodox, but that's how breakthroughs happen! Currently working on harnessing wormhole energy for practical applications!"
+        
+        elif character_name == "Anko":
+            return "*twirls kunai knife* The name's Anko. I get things done that others can't—or won't. Not all heroes wear their intentions on their sleeves, you know? Let's just say I keep the shadows in check."
+        
+        # Generic introduction combining role and backstory
+        if role and backstory:
+            return f"I am {character_name}, {role}. {backstory}"
+        elif role:
+            return f"I am {character_name}, {role}."
+        elif backstory:
+            return f"I am {character_name}. {backstory}"
+        else:
+            return f"I am {character_name}. My story is my own, and not all tales are meant to be shared freely."
+    
+    def _generate_lore_response(self, character_name: str, character_info: Dict, category: str) -> str:
+        """Generate a lore-related response from a character."""
+        # Get a random piece of lore from the specified category
+        category_name, lore_name, lore_content = self.lore_manager.get_random_lore(category)
+        
+        if not lore_content or lore_content == "No lore entries available":
+            return f"There are mysteries about {category} that even I do not fully comprehend."
+        
+        # Get character-specific introduction phrases
+        intros = self._get_character_intros(character_name, character_info)
+        intro = random.choice(intros)
+        
+        # Format the response
+        return f"{intro} {lore_content}"
     
     def _get_character_intros(self, character_name: str, character_info: Dict) -> List[str]:
         """Get character-specific introduction phrases."""
-        # Define default intros
+        # Default introduction phrases
         default_intros = [
+            "Let me tell you about",
+            "I know something of",
             "Indeed,",
             "As you may know,",
             "I must tell you that",
@@ -463,7 +738,7 @@ class QuestManager:
         
         inventory = []
         for item in items:
-            item_info = self.lore_manager.get_item_info(item['item_name'])
+            item_info = self.lore_manager.get_item(item['item_name'])
             description = ""
             if item_info and isinstance(item_info, dict):
                 description = item_info.get("description", "")

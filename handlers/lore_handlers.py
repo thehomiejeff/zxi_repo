@@ -24,12 +24,11 @@ logger = logging.getLogger(__name__)
 # Helper functions for callback data creation
 def create_lore_category_callback(category: str) -> str:
     """Create callback data for a lore category."""
-    return create_callback_data("lore_category", {"name": category})
+    return create_callback_data("lore_category", name=category) 
 
 def create_lore_entry_callback(entry_name: str) -> str:
     """Create callback data for a lore entry."""
-    return create_callback_data("lore_entry", {"name": entry_name})
-
+    return create_callback_data("lore_entry", name=entry_name) 
 class LoreCommandHandlers:
     """Handlers for lore-related commands."""
     

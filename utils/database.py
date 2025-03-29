@@ -95,6 +95,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS user_inventory (
                 user_id INTEGER,
                 item_name TEXT,
+                rarity TEXT DEFAULT 'common',
                 quantity INTEGER DEFAULT 1,
                 acquired_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, item_name),
@@ -291,12 +292,15 @@ class Database:
                 (user_id,)
             )
             
-            if result and 'state' in result[0]:
-                state_str = result[0]['state']
-                if state_str:
+            if result:
+                state_str = result[0]["state"]
+                try:
                     return json.loads(state_str)
-            
-            return {}
+                except json.JSONDecodeError:
+                    logger.error(f"Error decoding state JSON for user {user_id}")
+                    return {}
+            else:
+                return {}
         except Exception as e:
             logger.error(f"Error getting user state: {e}", exc_info=True)
             return {}
@@ -306,7 +310,7 @@ class Database:
         
         Args:
             user_id: The user ID to set state for
-            state: Dictionary containing user state
+            state: The state dictionary to set
             
         Returns:
             True if update was successful, False otherwise
@@ -353,95 +357,111 @@ class Database:
         to craft the specified item according to its recipe.
         
         Args:
-            user_id: The user ID to check inventory for
+            user_id: The user ID to check
             item_name: The name of the item to craft
             
         Returns:
-            Tuple containing (can_craft, message, recipe_info)
+            Tuple containing (can_craft, message, requirements_status)
         """
-        # Get recipe
-        recipe = self.execute_query(
-            "SELECT * FROM crafting_recipes WHERE result_item = ?",
-            (item_name,)
-        )
-        
-        if not recipe:
-            return False, f"No recipe found for {item_name}.", {}
-        
-        recipe = recipe[0]
-        
-        # Check inventory requirements
-        requirements = json.loads(recipe["requirements"])
-        user_inventory = self.execute_query(
-            "SELECT item_name, quantity FROM user_inventory WHERE user_id = ?",
-            (user_id,)
-        )
-        
-        if not user_inventory:
-            user_inventory = []
-        
-        # Convert to dict for easier lookup
-        inventory_dict = {item["item_name"]: item["quantity"] for item in user_inventory}
-        
-        missing_items = []
-        for req_item, req_quantity in requirements.items():
-            if req_item not in inventory_dict or inventory_dict[req_item] < req_quantity:
-                missing_items.append(f"{req_item} x{req_quantity}")
-        
-        # Check quest requirements
-        quest_requirements = json.loads(recipe["quest_requirements"])
-        
-        for quest_name, scene_choices in quest_requirements.items():
-            # Check if quest is completed
-            quest_completed = self.execute_query(
-                "SELECT * FROM user_progress WHERE user_id = ? AND category = 'quests' AND item_name = ? AND discovered = TRUE",
-                (user_id, quest_name)
+        try:
+            # Get the recipe for the item
+            recipe = self.execute_query(
+                "SELECT * FROM crafting_recipes WHERE result_item = ?",
+                (item_name,)
             )
             
-            if not quest_completed:
-                missing_items.append(f"Quest: {quest_name}")
-                continue
+            if not recipe:
+                return False, f"No recipe found for {item_name}.", {}
             
-            # Check specific choices if needed
-            for scene, choice in scene_choices.items():
-                choice_made = self.execute_query(
-                    "SELECT * FROM decision_logs WHERE user_id = ? AND quest_name = ? AND scene_id = ? AND choice_id = ?",
-                    (user_id, quest_name, scene, choice)
+            recipe = recipe[0]
+            
+            # Check inventory requirements
+            requirements = json.loads(recipe["requirements"])
+            user_inventory = self.execute_query(
+                "SELECT item_name, quantity FROM user_inventory WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            if not user_inventory:
+                user_inventory = []
+            
+            # Convert to dict for easier lookup
+            inventory_dict = {item["item_name"]: item["quantity"] for item in user_inventory}
+            
+            # Check if user has all required items
+            missing_items = []
+            requirements_status = {}
+            
+            for req_item, req_quantity in requirements.items():
+                available_quantity = inventory_dict.get(req_item, 0)
+                requirements_status[req_item] = {
+                    "required": req_quantity,
+                    "available": available_quantity,
+                    "sufficient": available_quantity >= req_quantity
+                }
+                
+                if available_quantity < req_quantity:
+                    missing_items.append(f"{req_item} ({available_quantity}/{req_quantity})")
+            
+            if missing_items:
+                return False, f"Missing required items: {', '.join(missing_items)}", requirements_status
+            
+            # Check quest requirements
+            quest_requirements = json.loads(recipe["quest_requirements"])
+            if quest_requirements:
+                completed_quests = self.execute_query(
+                    "SELECT * FROM user_progress WHERE user_id = ? AND category = 'quests' AND item_name = ? AND discovered = TRUE",
+                    (user_id, quest_requirements[0])  # Check first required quest
                 )
                 
-                if not choice_made:
-                    missing_items.append(f"Choice: {scene}-{choice} in {quest_name}")
-        
-        if missing_items:
-            return False, f"You are missing the following requirements to craft {item_name}:", {
-                "missing": missing_items,
-                "recipe": recipe
-            }
-        
-        return True, f"You can craft {item_name}!", {
-            "recipe": recipe,
-            "inventory": inventory_dict
-        }
+                if not completed_quests:
+                    return False, f"You need to complete the quest '{quest_requirements[0]}' first.", requirements_status
+            
+            return True, "You have all the required items to craft this.", requirements_status
+        except Exception as e:
+            logger.error(f"Error checking craft requirements: {e}", exc_info=True)
+            return False, f"Error checking craft requirements: {str(e)}", {}
     
     def craft_item(self, user_id: int, item_name: str) -> Tuple[bool, str]:
-        """Craft an item for a user."""
-        can_craft, message, details = self.can_craft_item(user_id, item_name)
+        """Craft an item for a user.
         
-        if not can_craft:
-            return False, message
+        Consumes the required components from the user's inventory and
+        adds the crafted item to their inventory.
         
-        try:
-            # Consume required items
-            recipe = details["recipe"]
-            requirements = json.loads(recipe["requirements"])
+        Args:
+            user_id: The user ID crafting the item
+            item_name: The name of the item to craft
             
+        Returns:
+            Tuple containing (success, message)
+        """
+        try:
+            # Check if user can craft the item
+            can_craft, message, _ = self.can_craft_item(user_id, item_name)
+            if not can_craft:
+                return False, message
+            
+            # Get the recipe
+            recipe = self.execute_query(
+                "SELECT * FROM crafting_recipes WHERE result_item = ?",
+                (item_name,)
+            )[0]
+            
+            # Consume required items
+            requirements = json.loads(recipe["requirements"])
             for req_item, req_quantity in requirements.items():
                 self.execute_query(
                     "UPDATE user_inventory SET quantity = quantity - ? WHERE user_id = ? AND item_name = ?",
                     (req_quantity, user_id, req_item)
                 )
+                
+                # Clean up items with quantity 0
+                self.execute_query(
+                    "DELETE FROM user_inventory WHERE user_id = ? AND item_name = ? AND quantity <= 0",
+                    (user_id, req_item)
+                )
             
-            # Add crafted item
+            # Add crafted item to inventory
             result_rarity = recipe["result_rarity"]
             
             # Check if item already exists in inventory
@@ -465,3 +485,99 @@ class Database:
         except Exception as e:
             logger.error(f"Error crafting item: {e}", exc_info=True)
             return False, f"Error crafting item: {str(e)}"
+    
+    def get_user_collection(self, user_id: int) -> List[Dict]:
+        """Get the user's collection of discovered lore.
+        
+        Args:
+            user_id: The user ID to get collection for
+            
+        Returns:
+            List of dictionaries containing discovered lore items
+        """
+        try:
+            # Get discovered lore from user_progress table
+            progress_items = self.execute_query(
+                "SELECT category, item_name, discovery_date FROM user_progress WHERE user_id = ? AND discovered = TRUE",
+                (user_id,)
+            )
+            
+            # Also update the discovered_lore field in users table to ensure consistency
+            if progress_items:
+                # Extract item names by category
+                collection_by_category = {}
+                for item in progress_items:
+                    category = item['category']
+                    if category not in collection_by_category:
+                        collection_by_category[category] = []
+                    collection_by_category[category].append(item['item_name'])
+                
+                # Update the discovered_lore field in users table
+                self.execute_query(
+                    "UPDATE users SET discovered_lore = ? WHERE user_id = ?",
+                    (json.dumps(collection_by_category), user_id)
+                )
+            
+            return progress_items
+        except Exception as e:
+            logger.error(f"Error getting user collection: {e}", exc_info=True)
+            return []
+    
+    def record_discovery(self, user_id: int, category: str, item_name: str) -> bool:
+        """Record a lore discovery for a user.
+        
+        Args:
+            user_id: The user ID to record discovery for
+            category: The category of the discovered item
+            item_name: The name of the discovered item
+            
+        Returns:
+            True if recording was successful, False otherwise
+        """
+        try:
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Check if this item is already discovered
+            existing = self.execute_query(
+                "SELECT 1 FROM user_progress WHERE user_id = ? AND category = ? AND item_name = ?",
+                (user_id, category, item_name)
+            )
+            
+            if existing:
+                # Update existing record
+                self.execute_query(
+                    "UPDATE user_progress SET discovered = TRUE, discovery_date = ? WHERE user_id = ? AND category = ? AND item_name = ?",
+                    (current_time, user_id, category, item_name)
+                )
+            else:
+                # Insert new record
+                self.execute_query(
+                    "INSERT INTO user_progress (user_id, category, item_name, discovered, discovery_date) VALUES (?, ?, ?, TRUE, ?)",
+                    (user_id, category, item_name, current_time)
+                )
+            
+            # Also update the discovered_lore field in users table
+            # Get all discovered items
+            all_discovered = self.execute_query(
+                "SELECT category, item_name FROM user_progress WHERE user_id = ? AND discovered = TRUE",
+                (user_id,)
+            )
+            
+            # Organize by category
+            collection_by_category = {}
+            for item in all_discovered:
+                category = item['category']
+                if category not in collection_by_category:
+                    collection_by_category[category] = []
+                collection_by_category[category].append(item['item_name'])
+            
+            # Update users table
+            self.execute_query(
+                "UPDATE users SET discovered_lore = ? WHERE user_id = ?",
+                (json.dumps(collection_by_category), user_id)
+            )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error recording discovery: {e}", exc_info=True)
+            return False

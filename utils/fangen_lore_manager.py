@@ -222,122 +222,52 @@ class FangenLoreManager:
                         rarity = "Legendary"
                     elif "Rare" in content[content.find(item)-100:content.find(item)+100]:
                         rarity = "Rare"
+                    elif "Uncommon" in content[content.find(item)-100:content.find(item)+100]:
+                        rarity = "Uncommon"
                     
-                    self.lore_data["items"][item.strip()] = {
-                        "name": item.strip(),
-                        "rarity": rarity,
-                        "description": "An item from the world of Fangen."
-                    }
+                    # Add item to lore data if not already present
+                    if item.strip() not in self.lore_data["items"]:
+                        self.lore_data["items"][item.strip()] = {
+                            "rarity": rarity,
+                            "description": f"A {rarity.lower()} item from the world of Fangen."
+                        }
         
-        # Look for quest narrative sections
-        quest_pattern = r'Quest Narratives:\s*(.*?)(?:\d\.\s*|$)'
+        # Look for quest narratives
+        quest_pattern = r'Quest Narratives:\s*(.*?)(?:$)'
         quest_match = re.search(quest_pattern, content, re.DOTALL)
         if quest_match:
             quest_text = quest_match.group(1)
             
-            # Parse quest themes
-            theme_pattern = r'•\s*([^:]+):\s*([^•]+)'
-            theme_items = re.findall(theme_pattern, quest_text, re.DOTALL)
-            
-            for theme_name, theme_desc in theme_items:
-                self.lore_data["quests"][theme_name.strip()] = theme_desc.strip()
-        
-        # Look for specific quest examples
-        quest_titles = re.findall(r'Quest: ([^\n]+)', content)
-        for title in quest_titles:
-            if title.strip() not in self.quests:
-                self.quests.append(title.strip())
-                
-                # Try to find quest description
-                quest_desc_pattern = fr'Quest: {re.escape(title)}(.*?)(?:Scene \d+:|$)'
-                quest_desc_match = re.search(quest_desc_pattern, content, re.DOTALL)
-                
-                if quest_desc_match:
+            # Parse individual quests
+            quest_sections = re.split(r'\d+\.\s+', quest_text)
+            for section in quest_sections[1:]:  # Skip the first empty split
+                # Extract quest title and description
+                title_match = re.match(r'([^\n]+)', section)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    description = section[len(title):].strip()
+                    
+                    # Add to quests list if not already present
+                    if title.strip() not in self.quests:
+                        self.quests.append(title.strip())
+                    
+                    # Add to lore data
                     self.lore_data["quests"][title.strip()] = {
-                        "title": title.strip(),
-                        "description": quest_desc_match.group(1).strip(),
-                        "scenes": self._parse_quest_scenes(content, title)
+                        "description": description,
+                        "requirements": [],
+                        "rewards": []
                     }
-    
-    def _parse_quest_scenes(self, content: str, quest_title: str) -> List[Dict]:
-        """Parse quest scenes for a specific quest.
-        
-        Extracts scene information including settings, dialogues, and player choices
-        for a given quest from the lore content.
-        
-        Args:
-            content: Raw lore text content to parse
-            quest_title: Title of the quest to parse scenes for
-            
-        Returns:
-            List of dictionaries containing scene data
-        """
-        scenes = []
-        
-        # Find all scenes in this quest with improved pattern matching
-        # This pattern is more robust to variations in formatting and handles scene transitions better
-        scene_pattern = f'Quest:\\s*{re.escape(quest_title)}.*?Scene\\s*(\\d+):\\s*([^\n]+)(.*?)(?:Scene\\s*\\d+:|Your\\s*Choice:|Epilogue:|$)'
-        scene_matches = re.findall(scene_pattern, content, re.DOTALL)
-        
-        for scene_num, scene_title, scene_content in scene_matches:
-            # Parse scene setting with improved pattern
-            setting_pattern = r'Setting:\s*(.*?)(?:[A-Z][a-z]+\s*:|$)'
-            setting_match = re.search(setting_pattern, scene_content, re.DOTALL)
-            setting = setting_match.group(1).strip() if setting_match else ""
-            
-            # Parse NPC dialogues with improved pattern
-            npc_dialogues = {}
-            npc_pattern = r'([A-Za-z, ]+)(?:\(.*?\))?:\s*"([^"]+)"'
-            npc_matches = re.findall(npc_pattern, scene_content, re.DOTALL)
-            
-            for npc, dialogue in npc_matches:
-                npc_dialogues[npc.strip()] = dialogue.strip()
-            
-            # Parse player choices with improved pattern
-            choices = []
-            choice_pattern = r'•\s*Option\s*(\d+[A-Z]?):\s*([^\n]+)(?:\nPlayer:\s*"([^"]+)")?\s*Outcome:(.*?)(?:•\s*Option\s*\d+[A-Z]?:|$)'
-            choice_matches = re.findall(choice_pattern, content, re.DOTALL)
-            
-            for choice_id, choice_desc, player_dialogue, outcome in choice_matches:
-                # Parse inventory updates
-                inv_updates = []
-                inv_pattern = r'\[INV_UPDATE: ([^\]]+)\]'
-                inv_matches = re.findall(inv_pattern, outcome, re.DOTALL)
-                
-                for inv_update in inv_matches:
-                    inv_updates.append(inv_update.strip())
-                
-                # Parse relationship updates
-                rel_updates = []
-                rel_pattern = r'\[REL_UPDATE: ([^\]]+)\]'
-                rel_matches = re.findall(rel_pattern, outcome, re.DOTALL)
-                
-                for rel_update in rel_matches:
-                    rel_updates.append(rel_update.strip())
-                
-                # Create choice data
-                choices.append({
-                    "id": choice_id,
-                    "description": choice_desc.strip(),
-                    "player_dialogue": player_dialogue.strip() if player_dialogue else "",
-                    "outcome": outcome.strip(),
-                    "inventory_updates": inv_updates,
-                    "relationship_updates": rel_updates
-                })
-            
-            # Create scene data
-            scenes.append({
-                "number": int(scene_num),
-                "title": scene_title.strip(),
-                "setting": setting,
-                "dialogues": npc_dialogues,
-                "choices": choices
-            })
-        
-        # Sort scenes by number
-        scenes.sort(key=lambda x: x["number"])
-        
-        return scenes
+                    
+                    # Try to extract requirements and rewards
+                    req_match = re.search(r'Requirements:\s*(.*?)(?:Rewards:|$)', description, re.DOTALL)
+                    if req_match:
+                        requirements = req_match.group(1).strip().split('\n')
+                        self.lore_data["quests"][title.strip()]["requirements"] = [r.strip() for r in requirements if r.strip()]
+                    
+                    reward_match = re.search(r'Rewards:\s*(.*?)(?:$)', description, re.DOTALL)
+                    if reward_match:
+                        rewards = reward_match.group(1).strip().split('\n')
+                        self.lore_data["quests"][title.strip()]["rewards"] = [r.strip() for r in rewards if r.strip()]
     
     def get_character(self, name: str) -> Optional[Dict]:
         """Get character information by name."""
@@ -374,42 +304,45 @@ class FangenLoreManager:
         
         # Search characters
         for name, data in self.lore_data["characters"].items():
-            if isinstance(data, dict):
-                # Combine all text fields for searching
-                text = f"{name} {' '.join(str(v) for v in data.values())}"
-                if query in text.lower():
-                    # Create a snippet from the backstory or role
-                    snippet = data.get("backstory", data.get("role", ""))
-                    if len(snippet) > 100:
-                        snippet = snippet[:97] + "..."
-                    results["characters"].append((name, snippet))
+            # Combine all character data for searching
+            char_text = name.lower()
+            for key, value in data.items():
+                if isinstance(value, str):
+                    char_text += " " + value.lower()
+            
+            if query in char_text:
+                # Create a snippet from the backstory or personality
+                snippet = data.get("backstory", "") or data.get("personality", "")
+                if len(snippet) > 100:
+                    snippet = snippet[:97] + "..."
+                results["characters"].append((name, snippet))
         
         # Search items
         for name, data in self.lore_data["items"].items():
+            # Handle both string and dict item data
             if isinstance(data, dict):
-                text = f"{name} {' '.join(str(v) for v in data.values())}"
-                if query in text.lower():
-                    snippet = data.get("description", "")
-                    if len(snippet) > 100:
-                        snippet = snippet[:97] + "..."
-                    results["items"].append((name, snippet))
-            elif isinstance(data, str) and query in (name.lower() + " " + data.lower()):
+                item_text = name.lower() + " " + " ".join(str(v).lower() for v in data.values())
+                snippet = data.get("description", "")
+            else:
+                item_text = name.lower() + " " + data.lower()
                 snippet = data
+            
+            if query in item_text:
                 if len(snippet) > 100:
                     snippet = snippet[:97] + "..."
                 results["items"].append((name, snippet))
         
         # Search quests
         for name, data in self.lore_data["quests"].items():
+            # Handle both string and dict quest data
             if isinstance(data, dict):
-                text = f"{name} {data.get('description', '')}"
-                if query in text.lower():
-                    snippet = data.get("description", "")
-                    if len(snippet) > 100:
-                        snippet = snippet[:97] + "..."
-                    results["quests"].append((name, snippet))
-            elif isinstance(data, str) and query in (name.lower() + " " + data.lower()):
+                quest_text = name.lower() + " " + " ".join(str(v).lower() for v in data.values())
+                snippet = data.get("description", "")
+            else:
+                quest_text = name.lower() + " " + data.lower()
                 snippet = data
+            
+            if query in quest_text:
                 if len(snippet) > 100:
                     snippet = snippet[:97] + "..."
                 results["quests"].append((name, snippet))
@@ -447,6 +380,42 @@ class FangenLoreManager:
                 results["factions"].append((name, snippet))
         
         return results
+    
+    def get_categories(self) -> List[str]:
+        """Get all available lore categories.
+        
+        Returns:
+            List of category names
+        """
+        categories = [
+            "characters",
+            "items",
+            "quests",
+            "world",
+            "events",
+            "themes",
+            "factions"
+        ]
+        return categories
+    
+    def get_quests(self) -> List[str]:
+        """Get all available quests.
+        
+        Returns:
+            List of quest names
+        """
+        return self.quests
+    
+    def get_quest_info(self, name: str) -> Optional[Dict]:
+        """Get detailed information about a specific quest.
+        
+        Args:
+            name: Name of the quest
+            
+        Returns:
+            Dictionary containing quest information or None if not found
+        """
+        return self.lore_data["quests"].get(name)
     
     def get_random_lore(self, category: str = None) -> Tuple[str, str, str]:
         """Get a random lore entry.
